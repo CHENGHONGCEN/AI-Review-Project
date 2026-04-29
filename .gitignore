@@ -1,0 +1,39 @@
+# Python virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Python caches and test/tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local app secrets and environment files
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Local runtime data and generated outputs
+exports/
+uploads/
+*.log
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary office/spreadsheet files
+~$*
