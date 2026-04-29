@@ -146,10 +146,11 @@ def make_prompt(fields: list[str], questions: list[str], prompt_template: str) -
         template = f"{template}\n\nStructured fields requested by the user:\n{{structured_fields}}"
     if "{research_questions}" not in template:
         template = f"{template}\n\nResearch questions requested by the user:\n{{research_questions}}"
-    return template.format(
-        structured_fields=field_list,
-        research_questions=question_list,
-    ).strip()
+    return (
+        template.replace("{structured_fields}", field_list)
+        .replace("{research_questions}", question_list)
+        .strip()
+    )
 
 
 def pdf_to_input_file(uploaded_file: Any) -> dict[str, str]:
@@ -196,9 +197,104 @@ def extract_from_pdf(
 
     raw_text = response.output_text
     data = json.loads(raw_text)
+    data = normalize_extraction_result(data, fields, questions)
     data["source_file"] = uploaded_file.name
+    data["requested_fields"] = fields
+    data["requested_questions"] = questions
     data["prompt_used"] = prompt
     return data
+
+
+def clean_text(value: Any, default: str = "Not found") -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def normalize_extraction_result(
+    data: dict[str, Any],
+    fields: list[str],
+    questions: list[str],
+) -> dict[str, Any]:
+    article = data.setdefault("article", {})
+    for key in ("title", "authors", "year", "journal"):
+        article[key] = clean_text(article.get(key))
+    article["overall_confidence"] = clean_text(article.get("overall_confidence"), "low").lower()
+    if article["overall_confidence"] not in CONFIDENCE_LEVELS:
+        article["overall_confidence"] = "low"
+    article["low_confidence_reason"] = clean_text(article.get("low_confidence_reason"))
+
+    returned_fields = {
+        clean_text(item.get("name"), "").casefold(): item
+        for item in data.get("structured_fields", [])
+        if isinstance(item, dict)
+    }
+    normalized_fields = []
+    for field in fields:
+        item = returned_fields.get(field.casefold(), {})
+        confidence = clean_text(item.get("confidence"), "low").lower()
+        normalized_fields.append(
+            {
+                "name": field,
+                "value": clean_text(item.get("value")),
+                "source_location": clean_text(item.get("source_location")),
+                "confidence": confidence if confidence in CONFIDENCE_LEVELS else "low",
+                "low_confidence_reason": clean_text(item.get("low_confidence_reason")),
+            }
+        )
+    data["structured_fields"] = normalized_fields
+
+    returned_evidence = [
+        item for item in data.get("research_question_evidence", []) if isinstance(item, dict)
+    ]
+    normalized_evidence = []
+    for index, question in enumerate(questions, start=1):
+        item = returned_evidence[index - 1] if index - 1 < len(returned_evidence) else {}
+        confidence = clean_text(item.get("confidence"), "low").lower()
+        excerpts = []
+        for excerpt in item.get("excerpts", []) or []:
+            if not isinstance(excerpt, dict):
+                continue
+            excerpts.append(
+                {
+                    "text": clean_text(excerpt.get("text")),
+                    "source_location": clean_text(excerpt.get("source_location")),
+                    "relevance_note": clean_text(excerpt.get("relevance_note")),
+                }
+            )
+        normalized_evidence.append(
+            {
+                "question": f"RQ{index}: {question}",
+                "answer_summary": clean_text(item.get("answer_summary")),
+                "confidence": confidence if confidence in CONFIDENCE_LEVELS else "low",
+                "low_confidence_reason": clean_text(item.get("low_confidence_reason")),
+                "excerpts": excerpts,
+            }
+        )
+    data["research_question_evidence"] = normalized_evidence
+    data["review_warnings"] = [
+        clean_text(warning, "") for warning in data.get("review_warnings", []) if clean_text(warning, "")
+    ]
+    return data
+
+
+def requested_fields_for_result(result: dict[str, Any]) -> list[str]:
+    fields = result.get("requested_fields")
+    if fields:
+        return list(fields)
+    return [item.get("name", "") for item in result.get("structured_fields", []) if item.get("name")]
+
+
+def requested_questions_for_result(result: dict[str, Any]) -> list[str]:
+    questions = result.get("requested_questions")
+    if questions:
+        return list(questions)
+    return [
+        evidence.get("question", "")
+        for evidence in result.get("research_question_evidence", [])
+        if evidence.get("question")
+    ]
 
 
 def result_to_flat_row(result: dict[str, Any]) -> dict[str, str]:
@@ -210,19 +306,22 @@ def result_to_flat_row(result: dict[str, Any]) -> dict[str, str]:
         "year": article.get("year", ""),
         "journal": article.get("journal", ""),
         "overall_confidence": article.get("overall_confidence", ""),
-        "low_confidence_reason": article.get("low_confidence_reason", ""),
         "review_warnings": "; ".join(result.get("review_warnings", [])),
     }
 
-    for item in result.get("structured_fields", []):
-        name = item.get("name", "field")
-        row[name] = item.get("value", "")
-        row[f"{name} confidence"] = item.get("confidence", "")
+    fields_by_name = {
+        item.get("name", "").casefold(): item for item in result.get("structured_fields", [])
+    }
+    for field in requested_fields_for_result(result):
+        item = fields_by_name.get(field.casefold(), {})
+        row[field] = clean_text(item.get("value"))
+        row[f"{field} confidence"] = clean_text(item.get("confidence"), "low")
 
-    for evidence in result.get("research_question_evidence", []):
-        question = evidence.get("question", "research question")
-        row[f"{question} summary"] = evidence.get("answer_summary", "")
-        row[f"{question} confidence"] = evidence.get("confidence", "")
+    evidence_items = result.get("research_question_evidence", [])
+    for index, _question in enumerate(requested_questions_for_result(result), start=1):
+        evidence = evidence_items[index - 1] if index - 1 < len(evidence_items) else {}
+        row[f"RQ{index} summary"] = clean_text(evidence.get("answer_summary"))
+        row[f"RQ{index} confidence"] = clean_text(evidence.get("confidence"), "low")
 
     return row
 
@@ -244,18 +343,18 @@ def result_to_evidence_rows(result: dict[str, Any]) -> list[dict[str, str]]:
     article = result.get("article", {})
     rows = []
     for question_index, evidence in enumerate(result.get("research_question_evidence", []), start=1):
-        excerpts = evidence.get("excerpts", []) or [{"text": "", "source_location": "", "relevance_note": ""}]
+        excerpts = evidence.get("excerpts", []) or [{"text": "Not found", "source_location": "Not found", "relevance_note": "Not found"}]
         for excerpt in excerpts:
             rows.append(
                 {
                     "File names": result.get("source_file", ""),
-                    "title": article.get("title", ""),
+                    "title": clean_text(article.get("title")),
                     "research question": f"RQ{question_index}",
-                    "answer_summary": evidence.get("answer_summary", ""),
-                    "confidence": evidence.get("confidence", ""),
-                    "excerpt": excerpt.get("text", ""),
-                    "source_location": excerpt.get("source_location", ""),
-                    "relevance_note": excerpt.get("relevance_note", ""),
+                    "answer_summary": clean_text(evidence.get("answer_summary")),
+                    "confidence": clean_text(evidence.get("confidence"), "low"),
+                    "excerpt": clean_text(excerpt.get("text")),
+                    "source_location": clean_text(excerpt.get("source_location")),
+                    "relevance_note": clean_text(excerpt.get("relevance_note")),
                 }
             )
     return rows
@@ -294,15 +393,17 @@ def tune_excel_sheet(sheet: Any) -> None:
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = border
 
+    header_by_column = {
+        cell.column: str(cell.value or "").casefold()
+        for cell in sheet[1]
+    }
+
     for row in sheet.iter_rows(min_row=2):
-        row_needs_review = any(
-            isinstance(cell.value, str) and confidence_needs_review(cell.value)
-            for cell in row
-        )
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             cell.border = border
-            if row_needs_review:
+            is_confidence_cell = "confidence" in header_by_column.get(cell.column, "")
+            if is_confidence_cell and isinstance(cell.value, str) and confidence_needs_review(cell.value):
                 cell.fill = review_fill
 
     for column_cells in sheet.columns:

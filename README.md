@@ -42,5 +42,6 @@ You can change the base URL later if you use another OpenAI-compatible provider.
 - Each PDF is processed as one article record.
 - If one PDF fails, the batch continues.
 - Missing information should be reported as `not found`, not guessed.
-- Low-confidence outputs are highlighted and included in the Excel export.
+- Confidence cells marked `medium` or `low` are highlighted in the Excel export for review.
+- If the extraction fields and research questions stay the same, the summary sheet keeps the same column structure.
 - The Excel export includes a `Methodology Prompt` sheet with the actual prompt used for the extraction.
