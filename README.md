@@ -9,7 +9,8 @@ The app is designed for personal research use:
 - Use an OpenAI-compatible API endpoint.
 - Export results as an Excel `.xlsx` workbook.
 - Extract research-question evidence with an exhaustive strategy rather than a fixed excerpt limit.
-- View, edit, and restore the AI prompt template for transparency and reproducibility.
+- Run MMAT 2018 quality assessment as a separate step or together with extraction.
+- View, edit, and restore separate AI prompt templates for extraction and MMAT appraisal.
 
 ## Setup
 
@@ -43,5 +44,21 @@ You can change the base URL later if you use another OpenAI-compatible provider.
 - If one PDF fails, the batch continues.
 - Missing information should be reported as `not found`, not guessed.
 - Confidence cells marked `medium` or `low` are highlighted in the Excel export for review.
+- MMAT response cells marked `No` or `Can't tell` are highlighted for review.
 - If the extraction fields and research questions stay the same, the summary sheet keeps the same column structure.
-- The Excel export includes a `Methodology Prompt` sheet with the actual prompt used for the extraction.
+- The Excel export includes extraction sheets, MMAT quality assessment sheets, and a `Methodology Prompt` sheet with the actual prompts used.
+
+## Quality Assessment / MMAT
+
+The MMAT workflow follows the 2018 tool:
+
+- Every PDF gets the two MMAT screening questions.
+- The app asks the AI to choose one MMAT study design category for suitable empirical primary studies.
+- The app then asks only the five criteria for that chosen category.
+- The app uses `Yes`, `No`, and `Can't tell`; it does not calculate an overall MMAT score.
+
+Use:
+
+- `Run extraction` to run only the extraction step.
+- `Run quality assessment` to run only MMAT.
+- `Run full workflow` to run extraction and MMAT for the same uploaded PDFs.

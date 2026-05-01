@@ -16,6 +16,15 @@ from openai import OpenAI
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-5.5"
 CONFIDENCE_LEVELS = ["high", "medium", "low"]
+MMAT_RESPONSES = ["Yes", "No", "Can't tell"]
+MMAT_STUDY_DESIGNS = [
+    "Qualitative",
+    "Quantitative randomized controlled trial",
+    "Quantitative non-randomized",
+    "Quantitative descriptive",
+    "Mixed methods",
+    "Not suitable for MMAT",
+]
 DEFAULT_PROMPT_TEMPLATE = """
 You are an expert systematic review data extractor with experience in evidence synthesis, qualitative evidence extraction, health communication research, and thematic analysis.
 
@@ -71,6 +80,91 @@ Structured fields requested by the user:
 
 Research questions requested by the user:
 {research_questions}
+""".strip()
+
+MMAT_SCREENING_QUESTIONS = [
+    {
+        "id": "S1",
+        "text": "Are there clear research questions?",
+    },
+    {
+        "id": "S2",
+        "text": "Do the collected data allow to address the research questions?",
+    },
+]
+
+MMAT_CATEGORY_CRITERIA = {
+    "Qualitative": [
+        ("1.1", "Is the qualitative approach appropriate to answer the research question?"),
+        ("1.2", "Are the qualitative data collection methods adequate to address the research question?"),
+        ("1.3", "Are the findings adequately derived from the data?"),
+        ("1.4", "Is the interpretation of results sufficiently substantiated by data?"),
+        ("1.5", "Is there coherence between qualitative data sources, collection, analysis and interpretation?"),
+    ],
+    "Quantitative randomized controlled trial": [
+        ("2.1", "Is randomization appropriately performed?"),
+        ("2.2", "Are the groups comparable at baseline?"),
+        ("2.3", "Are there complete outcome data?"),
+        ("2.4", "Are outcome assessors blinded to the intervention provided?"),
+        ("2.5", "Did the participants adhere to the assigned intervention?"),
+    ],
+    "Quantitative non-randomized": [
+        ("3.1", "Are the participants representative of the target population?"),
+        ("3.2", "Are measurements appropriate regarding both the outcome and intervention or exposure?"),
+        ("3.3", "Are there complete outcome data?"),
+        ("3.4", "Are the confounders accounted for in the design and analysis?"),
+        ("3.5", "During the study period, is the intervention administered or exposure occurred as intended?"),
+    ],
+    "Quantitative descriptive": [
+        ("4.1", "Is the sampling strategy relevant to address the research question?"),
+        ("4.2", "Is the sample representative of the target population?"),
+        ("4.3", "Are the measurements appropriate?"),
+        ("4.4", "Is the risk of nonresponse bias low?"),
+        ("4.5", "Is the statistical analysis appropriate to answer the research question?"),
+    ],
+    "Mixed methods": [
+        ("5.1", "Is there an adequate rationale for using a mixed methods design to address the research question?"),
+        ("5.2", "Are the different components of the study effectively integrated to answer the research question?"),
+        ("5.3", "Are the outputs of the integration of qualitative and quantitative components adequately interpreted?"),
+        ("5.4", "Are divergences and inconsistencies between quantitative and qualitative results adequately addressed?"),
+        ("5.5", "Do the different components of the study adhere to the quality criteria of each tradition of the methods involved?"),
+    ],
+}
+
+DEFAULT_MMAT_PROMPT_TEMPLATE = """
+You are an expert systematic review quality assessor using the Mixed Methods Appraisal Tool (MMAT), version 2018.
+
+Your task is to read the attached research article PDF and produce one MMAT quality assessment record. Work as a careful reviewer. Do not calculate a total score.
+
+Core rules:
+- Use only information found in the attached PDF.
+- Do not use outside knowledge or assumptions about similar studies.
+- Do not invent methods, study design, sample details, outcome data, page numbers, or author intentions.
+- Use the MMAT 2018 response options exactly: "Yes", "No", or "Can't tell".
+- If the PDF does not report enough information to answer a criterion, use "Can't tell".
+- Give a short plain-language justification for every answer.
+- Include page numbers when visible or inferable. If not, use section names such as "Abstract", "Methods", "Results", "Table 1", or "location unclear".
+- Mark confidence as "low" when the answer depends on unclear reporting, missing text, poor PDF quality, or difficult study design classification.
+
+MMAT workflow:
+1. Answer both screening questions for all PDFs:
+   S1. Are there clear research questions?
+   S2. Do the collected data allow to address the research questions?
+2. Decide whether the paper is an empirical primary study. MMAT is not suitable for reviews, protocols, editorials, commentaries, theoretical papers, and other non-empirical papers.
+3. If the paper is suitable for MMAT, classify it into exactly one study design category:
+   - Qualitative
+   - Quantitative randomized controlled trial
+   - Quantitative non-randomized
+   - Quantitative descriptive
+   - Mixed methods
+4. Rate only the five criteria for the chosen category. For mixed methods studies, rate only the five mixed methods criteria; do not expand all qualitative and quantitative criteria.
+5. If S1 or S2 is "No" or "Can't tell", continue the assessment if possible, but add a review warning that further MMAT appraisal may not be feasible or appropriate.
+
+Screening questions:
+{screening_questions}
+
+MMAT category criteria:
+{mmat_criteria}
 """.strip()
 
 
@@ -166,6 +260,88 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
 }
 
 
+MMAT_QUESTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "criterion_id": {"type": "string"},
+        "criterion": {"type": "string"},
+        "response": {"type": "string", "enum": MMAT_RESPONSES},
+        "justification": {"type": "string"},
+        "source_location": {"type": "string"},
+        "confidence": {"type": "string", "enum": CONFIDENCE_LEVELS},
+        "low_confidence_reason": {"type": "string"},
+    },
+    "required": [
+        "criterion_id",
+        "criterion",
+        "response",
+        "justification",
+        "source_location",
+        "confidence",
+        "low_confidence_reason",
+    ],
+}
+
+
+MMAT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "article": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "title": {"type": "string"},
+                "authors": {"type": "string"},
+                "year": {"type": "string"},
+                "journal": {"type": "string"},
+            },
+            "required": ["title", "authors", "year", "journal"],
+        },
+        "study_design": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "suitable_for_mmat": {"type": "boolean"},
+                "category": {"type": "string", "enum": MMAT_STUDY_DESIGNS},
+                "classification_reason": {"type": "string"},
+                "needs_human_review": {"type": "boolean"},
+            },
+            "required": [
+                "suitable_for_mmat",
+                "category",
+                "classification_reason",
+                "needs_human_review",
+            ],
+        },
+        "screening_questions": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": MMAT_QUESTION_SCHEMA,
+        },
+        "category_criteria": {
+            "type": "array",
+            "minItems": 5,
+            "maxItems": 5,
+            "items": MMAT_QUESTION_SCHEMA,
+        },
+        "review_warnings": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": [
+        "article",
+        "study_design",
+        "screening_questions",
+        "category_criteria",
+        "review_warnings",
+    ],
+}
+
+
 def split_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -183,6 +359,31 @@ def make_prompt(fields: list[str], questions: list[str], prompt_template: str) -
     return (
         template.replace("{structured_fields}", field_list)
         .replace("{research_questions}", question_list)
+        .strip()
+    )
+
+
+def format_mmat_criteria() -> str:
+    sections = []
+    for category, criteria in MMAT_CATEGORY_CRITERIA.items():
+        lines = [f"{category}:"]
+        lines.extend(f"- {criterion_id}. {criterion}" for criterion_id, criterion in criteria)
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
+
+
+def make_mmat_prompt(prompt_template: str) -> str:
+    screening_list = "\n".join(
+        f"- {item['id']}. {item['text']}" for item in MMAT_SCREENING_QUESTIONS
+    )
+    template = prompt_template.strip() or DEFAULT_MMAT_PROMPT_TEMPLATE
+    if "{screening_questions}" not in template:
+        template = f"{template}\n\nScreening questions:\n{{screening_questions}}"
+    if "{mmat_criteria}" not in template:
+        template = f"{template}\n\nMMAT category criteria:\n{{mmat_criteria}}"
+    return (
+        template.replace("{screening_questions}", screening_list)
+        .replace("{mmat_criteria}", format_mmat_criteria())
         .strip()
     )
 
@@ -239,11 +440,146 @@ def extract_from_pdf(
     return data
 
 
+def assess_quality_from_pdf(
+    uploaded_file: Any,
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt_template: str,
+) -> dict[str, Any]:
+    client = OpenAI(api_key=api_key, base_url=base_url.rstrip("/"))
+    prompt = make_mmat_prompt(prompt_template)
+
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    pdf_to_input_file(uploaded_file),
+                    {"type": "input_text", "text": prompt},
+                ],
+            }
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "mmat_quality_assessment",
+                "strict": True,
+                "schema": MMAT_SCHEMA,
+            }
+        },
+    )
+
+    raw_text = response.output_text
+    data = json.loads(raw_text)
+    data = normalize_mmat_result(data)
+    data["source_file"] = uploaded_file.name
+    data["mmat_prompt_used"] = prompt
+    return data
+
+
 def clean_text(value: Any, default: str = "Not found") -> str:
     if value is None:
         return default
     text = str(value).strip()
     return text if text else default
+
+
+def clean_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().casefold() in {"true", "yes", "1"}
+    return default
+
+
+def clean_confidence(value: Any) -> str:
+    confidence = clean_text(value, "low").lower()
+    return confidence if confidence in CONFIDENCE_LEVELS else "low"
+
+
+def clean_mmat_response(value: Any) -> str:
+    response = clean_text(value, "Can't tell")
+    return response if response in MMAT_RESPONSES else "Can't tell"
+
+
+def normalize_mmat_question(item: dict[str, Any], criterion_id: str, criterion: str) -> dict[str, str]:
+    return {
+        "criterion_id": clean_text(item.get("criterion_id"), criterion_id),
+        "criterion": clean_text(item.get("criterion"), criterion),
+        "response": clean_mmat_response(item.get("response")),
+        "justification": clean_text(item.get("justification")),
+        "source_location": clean_text(item.get("source_location")),
+        "confidence": clean_confidence(item.get("confidence")),
+        "low_confidence_reason": clean_text(item.get("low_confidence_reason"), ""),
+    }
+
+
+def normalize_mmat_result(data: dict[str, Any]) -> dict[str, Any]:
+    article = data.setdefault("article", {})
+    for key in ("title", "authors", "year", "journal"):
+        article[key] = clean_text(article.get(key))
+
+    study_design = data.setdefault("study_design", {})
+    category = clean_text(study_design.get("category"), "Not suitable for MMAT")
+    if category not in MMAT_STUDY_DESIGNS:
+        category = "Not suitable for MMAT"
+    study_design["category"] = category
+    study_design["suitable_for_mmat"] = clean_bool(
+        study_design.get("suitable_for_mmat"),
+        category != "Not suitable for MMAT",
+    )
+    study_design["classification_reason"] = clean_text(
+        study_design.get("classification_reason")
+    )
+    study_design["needs_human_review"] = clean_bool(
+        study_design.get("needs_human_review"),
+        category == "Not suitable for MMAT",
+    )
+
+    returned_screening = [
+        item for item in data.get("screening_questions", []) if isinstance(item, dict)
+    ]
+    normalized_screening = []
+    for index, expected in enumerate(MMAT_SCREENING_QUESTIONS):
+        item = returned_screening[index] if index < len(returned_screening) else {}
+        normalized_screening.append(
+            normalize_mmat_question(item, expected["id"], expected["text"])
+        )
+    data["screening_questions"] = normalized_screening
+
+    expected_criteria = MMAT_CATEGORY_CRITERIA.get(category)
+    if not expected_criteria:
+        expected_criteria = [
+            ("N/A1", "MMAT category criterion is not applicable because the paper is not suitable for MMAT."),
+            ("N/A2", "MMAT category criterion is not applicable because the paper is not suitable for MMAT."),
+            ("N/A3", "MMAT category criterion is not applicable because the paper is not suitable for MMAT."),
+            ("N/A4", "MMAT category criterion is not applicable because the paper is not suitable for MMAT."),
+            ("N/A5", "MMAT category criterion is not applicable because the paper is not suitable for MMAT."),
+        ]
+    returned_criteria = [
+        item for item in data.get("category_criteria", []) if isinstance(item, dict)
+    ]
+    normalized_criteria = []
+    for index, (criterion_id, criterion) in enumerate(expected_criteria):
+        item = returned_criteria[index] if index < len(returned_criteria) else {}
+        normalized_criteria.append(normalize_mmat_question(item, criterion_id, criterion))
+    data["category_criteria"] = normalized_criteria
+
+    warnings = [
+        clean_text(warning, "")
+        for warning in data.get("review_warnings", [])
+        if clean_text(warning, "")
+    ]
+    if any(item["response"] != "Yes" for item in normalized_screening):
+        warnings.append(
+            "One or both MMAT screening questions were not answered Yes; further appraisal may not be feasible or appropriate."
+        )
+    if not study_design["suitable_for_mmat"]:
+        warnings.append("This paper was marked as not suitable for MMAT appraisal.")
+    data["review_warnings"] = list(dict.fromkeys(warnings))
+    return data
 
 
 def normalize_extraction_result(
@@ -364,9 +700,15 @@ def confidence_needs_review(value: str) -> bool:
     return value.lower() in {"low", "medium"}
 
 
+def mmat_response_needs_review(value: str) -> bool:
+    return value in {"No", "Can't tell"}
+
+
 def style_results(df: pd.DataFrame) -> Any:
     def highlight(value: Any) -> str:
-        if isinstance(value, str) and confidence_needs_review(value):
+        if isinstance(value, str) and (
+            confidence_needs_review(value) or mmat_response_needs_review(value)
+        ):
             return "background-color: #ffe5e5; color: #7a1f1f;"
         return ""
 
@@ -389,6 +731,62 @@ def result_to_evidence_rows(result: dict[str, Any]) -> list[dict[str, str]]:
                     "excerpt": clean_text(excerpt.get("text")),
                     "source_location": clean_text(excerpt.get("source_location")),
                     "relevance_note": clean_text(excerpt.get("relevance_note")),
+                }
+            )
+    return rows
+
+
+def mmat_result_to_summary_row(result: dict[str, Any]) -> dict[str, str]:
+    article = result.get("article", {})
+    study_design = result.get("study_design", {})
+    row = {
+        "File names": result.get("source_file", ""),
+        "title": clean_text(article.get("title")),
+        "authors": clean_text(article.get("authors")),
+        "year": clean_text(article.get("year")),
+        "journal": clean_text(article.get("journal")),
+        "suitable_for_mmat": str(study_design.get("suitable_for_mmat", False)),
+        "study_design_category": clean_text(study_design.get("category")),
+        "classification_reason": clean_text(study_design.get("classification_reason")),
+        "needs_human_review": str(study_design.get("needs_human_review", False)),
+        "review_warnings": "; ".join(result.get("review_warnings", [])),
+    }
+
+    for item in result.get("screening_questions", []):
+        criterion_id = clean_text(item.get("criterion_id"), "S")
+        row[f"{criterion_id} response"] = clean_text(item.get("response"), "Can't tell")
+        row[f"{criterion_id} confidence"] = clean_text(item.get("confidence"), "low")
+
+    for item in result.get("category_criteria", []):
+        criterion_id = clean_text(item.get("criterion_id"), "criterion")
+        row[f"{criterion_id} response"] = clean_text(item.get("response"), "Can't tell")
+        row[f"{criterion_id} confidence"] = clean_text(item.get("confidence"), "low")
+
+    return row
+
+
+def mmat_result_to_evidence_rows(result: dict[str, Any]) -> list[dict[str, str]]:
+    article = result.get("article", {})
+    study_design = result.get("study_design", {})
+    rows = []
+    for section, items in (
+        ("Screening", result.get("screening_questions", [])),
+        ("Category criteria", result.get("category_criteria", [])),
+    ):
+        for item in items:
+            rows.append(
+                {
+                    "File names": result.get("source_file", ""),
+                    "title": clean_text(article.get("title")),
+                    "study_design_category": clean_text(study_design.get("category")),
+                    "section": section,
+                    "criterion_id": clean_text(item.get("criterion_id")),
+                    "criterion": clean_text(item.get("criterion")),
+                    "response": clean_text(item.get("response"), "Can't tell"),
+                    "justification": clean_text(item.get("justification")),
+                    "source_location": clean_text(item.get("source_location")),
+                    "confidence": clean_text(item.get("confidence"), "low"),
+                    "low_confidence_reason": clean_text(item.get("low_confidence_reason"), ""),
                 }
             )
     return rows
@@ -437,7 +835,14 @@ def tune_excel_sheet(sheet: Any) -> None:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             cell.border = border
             is_confidence_cell = "confidence" in header_by_column.get(cell.column, "")
-            if is_confidence_cell and isinstance(cell.value, str) and confidence_needs_review(cell.value):
+            is_response_cell = "response" in header_by_column.get(cell.column, "")
+            if (
+                isinstance(cell.value, str)
+                and (
+                    (is_confidence_cell and confidence_needs_review(cell.value))
+                    or (is_response_cell and mmat_response_needs_review(cell.value))
+                )
+            ):
                 cell.fill = review_fill
 
     for column_cells in sheet.columns:
@@ -499,7 +904,10 @@ def merge_repeated_evidence_cells(sheet: Any) -> None:
             previous_key = current_key
 
 
-def build_excel_export(results: list[dict[str, Any]]) -> bytes:
+def build_excel_export(
+    results: list[dict[str, Any]],
+    qa_results: list[dict[str, Any]],
+) -> bytes:
     workbook = Workbook()
     summary_sheet = workbook.active
     summary_sheet.title = "Article Summary"
@@ -523,15 +931,59 @@ def build_excel_export(results: list[dict[str, Any]]) -> bytes:
     merge_repeated_evidence_cells(evidence_sheet)
     tune_excel_sheet(evidence_sheet)
 
+    mmat_summary_sheet = workbook.create_sheet("MMAT Summary")
+    mmat_summary_rows = [mmat_result_to_summary_row(result) for result in qa_results]
+    if mmat_summary_rows:
+        add_rows_to_sheet(mmat_summary_sheet, mmat_summary_rows)
+    else:
+        mmat_summary_sheet.append(
+            [
+                "File names",
+                "title",
+                "suitable_for_mmat",
+                "study_design_category",
+                "S1 response",
+                "S2 response",
+                "review_warnings",
+            ]
+        )
+    tune_excel_sheet(mmat_summary_sheet)
+
+    mmat_evidence_sheet = workbook.create_sheet("MMAT Evidence")
+    mmat_evidence_rows = []
+    for result in qa_results:
+        mmat_evidence_rows.extend(mmat_result_to_evidence_rows(result))
+    if mmat_evidence_rows:
+        add_rows_to_sheet(mmat_evidence_sheet, mmat_evidence_rows)
+    else:
+        mmat_evidence_sheet.append(
+            [
+                "File names",
+                "title",
+                "study_design_category",
+                "section",
+                "criterion_id",
+                "criterion",
+                "response",
+                "justification",
+                "source_location",
+                "confidence",
+                "low_confidence_reason",
+            ]
+        )
+    tune_excel_sheet(mmat_evidence_sheet)
+
     methodology_sheet = workbook.create_sheet("Methodology Prompt")
     methodology_sheet.append(["item", "value"])
     methodology_sheet.append(["Generated", datetime.now().strftime("%Y-%m-%d %H:%M")])
-    methodology_sheet.append(["Prompt used", results[0].get("prompt_used", "not recorded") if results else "not recorded"])
-    methodology_sheet.append(["Prompt note", "This is the actual prompt text sent to the AI model after inserting the current structured fields and research questions."])
+    methodology_sheet.append(["Extraction prompt used", results[0].get("prompt_used", "not recorded") if results else "not recorded"])
+    methodology_sheet.append(["MMAT prompt used", qa_results[0].get("mmat_prompt_used", "not recorded") if qa_results else "not recorded"])
+    methodology_sheet.append(["Prompt note", "These are the actual prompt texts sent to the AI model for extraction and MMAT quality assessment."])
     tune_excel_sheet(methodology_sheet)
     methodology_sheet.column_dimensions["A"].width = 22
     methodology_sheet.column_dimensions["B"].width = 100
     methodology_sheet.row_dimensions[3].height = 240
+    methodology_sheet.row_dimensions[4].height = 240
 
     output = io.BytesIO()
     workbook.save(output)
@@ -541,8 +993,11 @@ def build_excel_export(results: list[dict[str, Any]]) -> bytes:
 def initialise_state() -> None:
     st.session_state.setdefault("results", [])
     st.session_state.setdefault("errors", [])
+    st.session_state.setdefault("qa_results", [])
+    st.session_state.setdefault("qa_errors", [])
     st.session_state.setdefault("research_questions", [""])
     st.session_state.setdefault("prompt_template", DEFAULT_PROMPT_TEMPLATE)
+    st.session_state.setdefault("mmat_prompt_template", DEFAULT_MMAT_PROMPT_TEMPLATE)
 
 
 def apply_custom_style() -> None:
@@ -590,10 +1045,58 @@ def apply_custom_style() -> None:
             background: transparent !important;
         }
 
+        #MainMenu,
+        .stDeployButton,
+        .stAppDeployButton {
+            display: none !important;
+            visibility: hidden !important;
+        }
+
+        .top-brand {
+            position: fixed;
+            top: 1.28rem;
+            left: 4.1rem;
+            z-index: 999990;
+            color: var(--text-main);
+            font-size: 1.24rem;
+            font-weight: 760;
+            letter-spacing: 0;
+            line-height: 1;
+            pointer-events: none;
+        }
+
+        [data-testid="stSidebar"]::before {
+            content: "AQEReview";
+            position: fixed;
+            top: 1.15rem;
+            left: 1.15rem;
+            z-index: 999991;
+            color: var(--text-main);
+            font-size: 1.24rem;
+            font-weight: 760;
+            line-height: 1;
+            margin: 0;
+            pointer-events: none;
+        }
+
         [data-testid="stSidebar"] > div:first-child {
-            padding-top: 1.35rem;
+            padding-top: 1.85rem;
             padding-left: 1.15rem;
             padding-right: 1.15rem;
+        }
+
+        [data-testid="stSidebar"] button.e7msn5c15 {
+            position: fixed !important;
+            top: 0.83rem !important;
+            left: 15.6rem !important;
+            z-index: 999992 !important;
+            color: var(--text-muted) !important;
+            opacity: 1 !important;
+            visibility: visible !important;
+        }
+
+        [data-testid="stSidebar"] button.e7msn5c15 span {
+            color: var(--text-muted) !important;
         }
 
         [data-testid="stSidebar"] h2,
@@ -679,15 +1182,33 @@ def apply_custom_style() -> None:
         }
 
         div[data-testid="stFileUploader"] section {
-            border-radius: 15px;
+            border-radius: 0 0 18px 18px;
             border-color: var(--border);
-            background: #f8fafc;
-            padding: 1.15rem;
+            border-top: 0;
+            background: var(--panel-bg);
+            min-height: 92px !important;
+            padding: 0.85rem 1rem !important;
+            align-items: flex-start;
+            box-shadow: var(--shadow);
+        }
+
+        div[data-testid="stFileUploader"] section > div {
+            min-height: auto !important;
+            gap: 0.55rem;
+        }
+
+        div[data-testid="stFileUploader"] small {
+            margin-top: 0.15rem;
+        }
+
+        div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] {
+            min-height: 92px !important;
         }
 
         div[data-testid="stFileUploader"] section:hover {
             border-color: var(--border-strong);
-            background: #f1f5f9;
+            border-top: 0;
+            background: #f8fafc;
         }
 
         div[data-testid="stDataFrame"] {
@@ -803,11 +1324,12 @@ def apply_custom_style() -> None:
 
         .upload-shell {
             border: 1px solid var(--border);
+            border-bottom: 0;
             background: var(--panel-bg);
-            border-radius: 18px;
-            padding: 1.05rem 1.05rem 0.95rem;
+            border-radius: 18px 18px 0 0;
+            padding: 0.95rem 1rem 0.85rem;
             box-shadow: var(--shadow);
-            margin-bottom: 1rem;
+            margin-bottom: -1px;
         }
 
         .upload-title {
@@ -823,7 +1345,11 @@ def apply_custom_style() -> None:
             color: var(--text-muted);
             font-size: 0.9rem;
             line-height: 1.45;
-            margin-bottom: 0.85rem;
+            margin-bottom: 0;
+        }
+
+        .action-spacer {
+            height: 1.55rem;
         }
 
         .action-row-note {
@@ -838,6 +1364,18 @@ def apply_custom_style() -> None:
         }
 
         @media (max-width: 900px) {
+            .top-brand {
+                left: 3.7rem;
+                top: 1.28rem;
+                font-size: 1.12rem;
+            }
+
+            [data-testid="stSidebar"]::before {
+                left: 1.15rem;
+                top: 1.15rem;
+                font-size: 1.12rem;
+            }
+
             .metric-grid {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
             }
@@ -875,11 +1413,12 @@ def svg_icon(name: str) -> str:
 def render_header() -> None:
     st.markdown(
         f"""
+        <div class="top-brand">AQEReview</div>
         <div class="app-hero">
-            <div class="app-kicker">{svg_icon("spark")} Systematic review extraction workspace</div>
-            <h1>AI Systematic Review Extraction</h1>
+            <div class="app-kicker">{svg_icon("spark")} AQEReview systematic review workspace</div>
+            <h1>Evidence Extraction & Quality Appraisal</h1>
             <div style="color:#64748b; max-width:760px; line-height:1.55; font-size:1rem;">
-                Batch extract article metadata, structured fields, and exhaustive research-question evidence from PDFs.
+                Batch extract article evidence and run MMAT 2018 quality assessment from PDFs.
             </div>
         </div>
         """,
@@ -891,13 +1430,15 @@ def render_workspace_panel(
     uploaded_count: int,
     field_count: int,
     question_count: int,
+    extraction_result_count: int,
+    qa_result_count: int,
     model: str,
 ) -> None:
     st.markdown(
         f"""
         <div class="workspace-panel">
-            <div class="panel-title">{svg_icon("search")} Extraction run</div>
-            <div class="panel-subtitle">A compact check of the current batch setup before you run extraction.</div>
+            <div class="panel-title">{svg_icon("search")} Workflow status</div>
+            <div class="panel-subtitle">A compact check of the current batch setup before you run extraction or MMAT quality assessment.</div>
             <div class="metric-grid">
                 <div class="metric-card">
                     {svg_icon("file")}
@@ -913,6 +1454,16 @@ def render_workspace_panel(
                     {svg_icon("search")}
                     <div class="metric-label">Research questions</div>
                     <div class="metric-value">{question_count}</div>
+                </div>
+                <div class="metric-card">
+                    {svg_icon("sheet")}
+                    <div class="metric-label">Extraction results</div>
+                    <div class="metric-value">{extraction_result_count}</div>
+                </div>
+                <div class="metric-card">
+                    {svg_icon("sheet")}
+                    <div class="metric-label">MMAT results</div>
+                    <div class="metric-value">{qa_result_count}</div>
                 </div>
                 <div class="metric-card">
                     {svg_icon("settings")}
@@ -950,20 +1501,24 @@ def restore_default_prompt() -> None:
     st.session_state.prompt_template = DEFAULT_PROMPT_TEMPLATE
 
 
+def restore_default_mmat_prompt() -> None:
+    st.session_state.mmat_prompt_template = DEFAULT_MMAT_PROMPT_TEMPLATE
+
+
 def render_prompt_editor() -> str:
-    with st.expander("Prompt transparency and editing", expanded=False):
+    with st.expander("Extraction prompt", expanded=False):
         st.markdown(
-            '<div class="section-note">This template is visible for transparency. The placeholders are filled automatically before each PDF is sent to the model.</div>',
+            '<div class="section-note">Edit the prompt used for article data extraction. The placeholders are filled automatically before each PDF is sent to the model.</div>',
             unsafe_allow_html=True,
         )
         st.button(
-            "Restore default prompt",
+            "Restore default extraction prompt",
             key="restore_prompt",
-            help="Reset the prompt template to the built-in default.",
+            help="Reset the extraction prompt template to the built-in default.",
             on_click=restore_default_prompt,
         )
         prompt_template = st.text_area(
-            "Prompt template",
+            "Extraction prompt template",
             key="prompt_template",
             height=420,
             help="Keep {structured_fields} and {research_questions} if you want the app to insert the current template fields and RQs at those positions.",
@@ -976,6 +1531,37 @@ def render_prompt_editor() -> str:
         if missing:
             st.info(
                 "Missing placeholders will be appended automatically when extraction runs: "
+                + ", ".join(missing)
+            )
+        return prompt_template
+
+
+def render_mmat_prompt_editor() -> str:
+    with st.expander("MMAT assessment prompt", expanded=False):
+        st.markdown(
+            '<div class="section-note">Edit the prompt used for MMAT quality assessment. This is separate from the extraction prompt.</div>',
+            unsafe_allow_html=True,
+        )
+        st.button(
+            "Restore default MMAT prompt",
+            key="restore_mmat_prompt",
+            help="Reset the MMAT prompt template to the built-in default.",
+            on_click=restore_default_mmat_prompt,
+        )
+        prompt_template = st.text_area(
+            "MMAT prompt template",
+            key="mmat_prompt_template",
+            height=420,
+            help="Keep {screening_questions} and {mmat_criteria} if you want the app to insert the MMAT 2018 criteria at those positions.",
+        )
+        missing = [
+            placeholder
+            for placeholder in ("{screening_questions}", "{mmat_criteria}")
+            if placeholder not in prompt_template
+        ]
+        if missing:
+            st.info(
+                "Missing placeholders will be appended automatically when quality assessment runs: "
                 + ", ".join(missing)
             )
         return prompt_template
@@ -1047,12 +1633,22 @@ def render_template() -> tuple[list[str], list[str]]:
 
 def render_results() -> None:
     if st.session_state.results:
-        st.subheader("Results")
+        st.subheader("Extraction results")
         rows = [result_to_flat_row(result) for result in st.session_state.results]
         df = pd.DataFrame(rows)
         st.dataframe(style_results(df), width="stretch")
 
-        export_bytes = build_excel_export(st.session_state.results)
+    if st.session_state.qa_results:
+        st.subheader("MMAT quality assessment results")
+        rows = [mmat_result_to_summary_row(result) for result in st.session_state.qa_results]
+        df = pd.DataFrame(rows)
+        st.dataframe(style_results(df), width="stretch")
+
+    if st.session_state.results or st.session_state.qa_results:
+        export_bytes = build_excel_export(
+            st.session_state.results,
+            st.session_state.qa_results,
+        )
         st.download_button(
             "Download Excel export",
             data=export_bytes,
@@ -1065,9 +1661,94 @@ def render_results() -> None:
         for error in st.session_state.errors:
             st.error(f"{error['file']}: {error['message']}")
 
+    if st.session_state.qa_errors:
+        st.subheader("Failed MMAT assessments")
+        for error in st.session_state.qa_errors:
+            st.error(f"{error['file']}: {error['message']}")
+
+
+def run_extraction_batch(
+    uploaded_files: list[Any],
+    api_key: str,
+    base_url: str,
+    model: str,
+    fields: list[str],
+    questions: list[str],
+    prompt_template: str,
+    status: Any,
+    progress: Any,
+    progress_offset: int = 0,
+    progress_total: int | None = None,
+) -> None:
+    st.session_state.results = []
+    st.session_state.errors = []
+    total = progress_total or len(uploaded_files)
+
+    for index, uploaded_file in enumerate(uploaded_files, start=1):
+        status.info(f"Extracting {uploaded_file.name} ({index}/{len(uploaded_files)})")
+        try:
+            result = extract_from_pdf(
+                uploaded_file=uploaded_file,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                fields=fields,
+                questions=questions,
+                prompt_template=prompt_template,
+            )
+            st.session_state.results.append(result)
+        except Exception as exc:
+            st.session_state.errors.append(
+                {"file": uploaded_file.name, "message": str(exc)}
+            )
+        progress.progress((progress_offset + index) / total)
+
+
+def run_mmat_batch(
+    uploaded_files: list[Any],
+    api_key: str,
+    base_url: str,
+    model: str,
+    mmat_prompt_template: str,
+    status: Any,
+    progress: Any,
+    progress_offset: int = 0,
+    progress_total: int | None = None,
+) -> None:
+    st.session_state.qa_results = []
+    st.session_state.qa_errors = []
+    total = progress_total or len(uploaded_files)
+
+    for index, uploaded_file in enumerate(uploaded_files, start=1):
+        status.info(f"Assessing MMAT quality for {uploaded_file.name} ({index}/{len(uploaded_files)})")
+        try:
+            result = assess_quality_from_pdf(
+                uploaded_file=uploaded_file,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                prompt_template=mmat_prompt_template,
+            )
+            st.session_state.qa_results.append(result)
+        except Exception as exc:
+            st.session_state.qa_errors.append(
+                {"file": uploaded_file.name, "message": str(exc)}
+            )
+        progress.progress((progress_offset + index) / total)
+
+
+def can_run_common(api_key: str, uploaded_files: list[Any] | None) -> bool:
+    if not api_key:
+        st.warning("Please enter an API key before running.")
+        return False
+    if not uploaded_files:
+        st.warning("Please upload at least one PDF.")
+        return False
+    return True
+
 
 def main() -> None:
-    st.set_page_config(page_title="AI Systematic Review Extraction", layout="wide")
+    st.set_page_config(page_title="AQEReview", layout="wide")
     apply_custom_style()
     initialise_state()
 
@@ -1077,76 +1758,124 @@ def main() -> None:
         fields, questions = render_template()
         st.divider()
         prompt_template = render_prompt_editor()
+        st.divider()
+        mmat_prompt_template = render_mmat_prompt_editor()
 
     render_header()
 
-    upload_col, summary_col = st.columns([0.64, 0.36], gap="medium", vertical_alignment="top")
-    with upload_col:
-        render_upload_intro()
-        uploaded_files = st.file_uploader(
-            "Upload PDF articles",
-            type=["pdf"],
-            accept_multiple_files=True,
-            label_visibility="collapsed",
-            help="Select multiple PDFs. Browser folder upload is not required in this first version.",
-        )
+    render_upload_intro()
+    uploaded_files = st.file_uploader(
+        "Upload PDF articles",
+        type=["pdf"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        help="Select multiple PDFs. Browser folder upload is not required in this first version.",
+    )
 
-    with summary_col:
-        render_workspace_panel(
-            uploaded_count=len(uploaded_files or []),
-            field_count=len(fields),
-            question_count=len(questions),
-            model=model,
-        )
+    render_workspace_panel(
+        uploaded_count=len(uploaded_files or []),
+        field_count=len(fields),
+        question_count=len(questions),
+        extraction_result_count=len(st.session_state.results),
+        qa_result_count=len(st.session_state.qa_results),
+        model=model,
+    )
 
-    col_run, col_clear, col_note = st.columns([0.22, 0.24, 0.54], vertical_alignment="center")
+    st.markdown('<div class="action-spacer"></div>', unsafe_allow_html=True)
 
-    with col_run:
-        run = st.button("Run extraction", type="primary")
+    col_extract, col_mmat, col_full, col_clear = st.columns(
+        [0.22, 0.27, 0.22, 0.18],
+        vertical_alignment="center",
+    )
+
+    with col_extract:
+        run_extraction = st.button("Run extraction")
+    with col_mmat:
+        run_mmat = st.button("Run quality assessment")
+    with col_full:
+        run_full = st.button("Run full workflow")
     with col_clear:
         if st.button("Clear results"):
             st.session_state.results = []
             st.session_state.errors = []
+            st.session_state.qa_results = []
+            st.session_state.qa_errors = []
             st.rerun()
-    with col_note:
-        st.markdown(
-            '<div class="action-row-note">Results export to a stable Excel workbook with article summary, evidence excerpts, and the exact prompt used.</div>',
-            unsafe_allow_html=True,
-        )
 
-    if run:
-        if not api_key:
-            st.warning("Please enter an API key before running extraction.")
-        elif not uploaded_files:
-            st.warning("Please upload at least one PDF.")
+    st.markdown(
+        '<div class="action-row-note">Results export to one Excel workbook with extraction sheets, MMAT sheets, and the exact prompts used.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if run_extraction:
+        if can_run_common(api_key, uploaded_files):
+            if not fields and not questions:
+                st.warning("Please enter at least one structured field or research question.")
+            else:
+                progress = st.progress(0)
+                status = st.empty()
+                run_extraction_batch(
+                    uploaded_files=uploaded_files,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    fields=fields,
+                    questions=questions,
+                    prompt_template=prompt_template,
+                    status=status,
+                    progress=progress,
+                )
+                status.success("Extraction finished.")
+
+    if run_mmat:
+        if can_run_common(api_key, uploaded_files):
+            progress = st.progress(0)
+            status = st.empty()
+            run_mmat_batch(
+                uploaded_files=uploaded_files,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                mmat_prompt_template=mmat_prompt_template,
+                status=status,
+                progress=progress,
+            )
+            status.success("MMAT quality assessment finished.")
+
+    if run_full:
+        if not can_run_common(api_key, uploaded_files):
+            pass
         elif not fields and not questions:
             st.warning("Please enter at least one structured field or research question.")
         else:
-            st.session_state.results = []
-            st.session_state.errors = []
             progress = st.progress(0)
             status = st.empty()
-
-            for index, uploaded_file in enumerate(uploaded_files, start=1):
-                status.info(f"Processing {uploaded_file.name} ({index}/{len(uploaded_files)})")
-                try:
-                    result = extract_from_pdf(
-                        uploaded_file=uploaded_file,
-                        api_key=api_key,
-                        base_url=base_url,
-                        model=model,
-                        fields=fields,
-                        questions=questions,
-                        prompt_template=prompt_template,
-                    )
-                    st.session_state.results.append(result)
-                except Exception as exc:
-                    st.session_state.errors.append(
-                        {"file": uploaded_file.name, "message": str(exc)}
-                    )
-                progress.progress(index / len(uploaded_files))
-
-            status.success("Batch finished.")
+            total_steps = len(uploaded_files) * 2
+            run_extraction_batch(
+                uploaded_files=uploaded_files,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                fields=fields,
+                questions=questions,
+                prompt_template=prompt_template,
+                status=status,
+                progress=progress,
+                progress_offset=0,
+                progress_total=total_steps,
+            )
+            run_mmat_batch(
+                uploaded_files=uploaded_files,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                mmat_prompt_template=mmat_prompt_template,
+                status=status,
+                progress=progress,
+                progress_offset=len(uploaded_files),
+                progress_total=total_steps,
+            )
+            status.success("Full workflow finished.")
 
     st.markdown('<div class="results-spacer"></div>', unsafe_allow_html=True)
     render_results()
