@@ -17,20 +17,54 @@ DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-5.5"
 CONFIDENCE_LEVELS = ["high", "medium", "low"]
 DEFAULT_PROMPT_TEMPLATE = """
-You are helping with systematic review data extraction.
+You are an expert systematic review data extractor with experience in evidence synthesis, qualitative evidence extraction, health communication research, and thematic analysis.
 
-Read the attached research article PDF and extract information for one article record.
+Your task is to read the attached research article PDF and extract information for one article record. Work as a careful research assistant, not as a creative writer.
 
-Important rules:
-- Do not guess. If something is absent or unclear, write "not found".
-- Preserve original wording in evidence excerpts.
+Core principles:
+- Accuracy is more important than fluency.
+- Transparency is more important than completeness of prose.
+- Do not invent, infer beyond the article, or fill gaps from general knowledge.
+- If the article does not clearly provide an answer, write "Not found".
+- If the article is unrelated to a research question, write "Not relevant to this article" in the summary and explain why briefly when possible.
+- Preserve original wording in evidence excerpts. Do not paraphrase inside excerpt text.
+- Keep summaries concise and evidence-based. Summaries must be supported by the extracted excerpts or clearly identifiable article content.
+
+Anti-hallucination rules:
+- Use only information found in the attached PDF.
+- Do not use outside knowledge, assumptions about the topic, or common patterns from similar papers.
+- Do not make up page numbers, sections, participant characteristics, methods, outcomes, or conclusions.
+- Do not treat the abstract alone as enough if the full text contains more specific evidence.
+- If a requested field is ambiguous, choose the most conservative answer and mark confidence as "low".
+- If evidence is indirect, partial, or only implied, say so in low_confidence_reason.
+- If the PDF text is unreadable, incomplete, scanned poorly, or appears to omit pages, mark confidence as "low" and add a review warning.
+
+Anti-miss rules:
 - Use an exhaustive extraction strategy for research-question evidence.
+- Search the whole article, including abstract, introduction/background, methods, results/findings, discussion, tables, figures, boxes, appendices, and limitations if available.
 - For each research question, extract every relevant original-text excerpt you can find.
 - Err on the side of including more potentially relevant excerpts rather than fewer.
-- Prefer excerpts that are useful for later thematic analysis, but do not omit borderline relevant text merely to keep the list short.
-- Include page numbers or section names in source_location when you can identify them.
-- Mark confidence as "low" when the article is scanned poorly, evidence is indirect, pages are missing, or the answer is uncertain.
-- Use low_confidence_reason to explain any medium or low confidence output in plain language.
+- Include borderline relevant excerpts when they may help later thematic analysis, and explain the relevance_note.
+- Do not omit repeated but meaningfully different evidence from different sections or participant groups.
+- Do not collapse multiple distinct findings into one excerpt if separate excerpts would be useful for coding.
+
+Source-location rules:
+- Include page numbers when visible or inferable from the PDF.
+- If page numbers are not visible, use section names such as "Abstract", "Results", "Discussion", "Table 2", or "Figure 1".
+- If neither page nor section is clear, write "location unclear".
+
+Confidence rules:
+- Use "high" only when the answer is directly supported by clear article text.
+- Use "medium" when the answer is supported but incomplete, scattered, or requires minor interpretation.
+- Use "low" when the answer is uncertain, indirect, missing, contradictory, or affected by PDF quality.
+- Use low_confidence_reason to explain every medium or low confidence answer in plain language.
+
+Output content rules:
+- Return one article record only.
+- For every requested structured field, provide a value, source_location, confidence, and low_confidence_reason.
+- For every requested research question, provide an answer_summary, confidence, low_confidence_reason, and all relevant excerpts.
+- Never leave required values blank. Use "Not found" or "Not relevant to this article" where appropriate.
+- Follow the required structured output schema exactly.
 
 Structured fields requested by the user:
 {structured_fields}
@@ -516,16 +550,20 @@ def apply_custom_style() -> None:
         """
         <style>
         :root {
-            --app-bg: #ffffff;
+            --app-bg: #f6f8fb;
             --panel-bg: #ffffff;
-            --sidebar-bg: #f7f7f8;
-            --text-main: #0d0d0d;
-            --text-muted: #6b7280;
-            --border: #e5e7eb;
-            --border-strong: #d1d5db;
-            --accent: #10a37f;
-            --accent-dark: #0d8f70;
-            --danger: #ef4444;
+            --sidebar-bg: #eef2f7;
+            --text-main: #111827;
+            --text-muted: #64748b;
+            --border: #dfe6ef;
+            --border-strong: #c7d2df;
+            --accent: #334155;
+            --accent-soft: #eef3f8;
+            --shadow: 0 18px 46px rgba(15, 23, 42, 0.08);
+        }
+
+        html, body, [class*="css"] {
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", Inter, "Segoe UI", sans-serif;
         }
 
         .stApp {
@@ -538,55 +576,94 @@ def apply_custom_style() -> None:
             border-right: 1px solid var(--border);
         }
 
+        [data-testid="stHeader"],
+        header[data-testid="stHeader"],
+        [data-testid="stAppViewContainer"] > header,
+        .stAppHeader {
+            background: var(--app-bg) !important;
+            box-shadow: none !important;
+            border-bottom: 1px solid var(--border) !important;
+        }
+
+        [data-testid="stToolbar"],
+        .stAppToolbar {
+            background: transparent !important;
+        }
+
+        [data-testid="stSidebar"] > div:first-child {
+            padding-top: 1.35rem;
+            padding-left: 1.15rem;
+            padding-right: 1.15rem;
+        }
+
         [data-testid="stSidebar"] h2,
         [data-testid="stSidebar"] h3 {
             color: var(--text-main);
             letter-spacing: 0;
+            font-size: 1rem;
+            font-weight: 680;
         }
 
         .main .block-container {
-            max-width: 1040px;
-            padding-top: 2.4rem;
-            padding-bottom: 3rem;
+            max-width: 1120px;
+            padding-top: 2.15rem;
+            padding-bottom: 2.8rem;
         }
 
         h1 {
             color: var(--text-main);
-            font-weight: 720;
-            font-size: 2.35rem;
+            font-weight: 650;
+            font-size: clamp(2.15rem, 4vw, 3.35rem);
             letter-spacing: 0;
+            line-height: 1.04;
+            margin-bottom: 0.45rem;
         }
 
         div[data-testid="stCaptionContainer"] {
             color: var(--text-muted);
         }
 
+        label, .stMarkdown p {
+            color: var(--text-main);
+        }
+
         .stTextInput input,
         .stTextArea textarea {
-            border-radius: 8px;
+            border-radius: 11px;
             border: 1px solid var(--border-strong);
             background: #ffffff;
             color: var(--text-main);
+            box-shadow: none;
         }
 
         .stTextInput input:focus,
         .stTextArea textarea:focus {
             border-color: var(--accent);
-            box-shadow: 0 0 0 1px var(--accent);
+            box-shadow: 0 0 0 1px rgba(89, 104, 92, 0.24);
         }
 
         .stButton button {
-            border-radius: 8px;
-            border: 1px solid var(--border-strong);
+            border-radius: 999px;
+            border: 1px solid var(--border);
             background: #ffffff;
             color: var(--text-main);
-            font-weight: 650;
+            font-weight: 620;
+            min-height: 2.6rem;
+            padding-left: 1.05rem;
+            padding-right: 1.05rem;
         }
 
         .stButton button:hover {
-            border-color: #9ca3af;
+            border-color: var(--border-strong);
             color: var(--text-main);
-            background: #f9fafb;
+            background: #f8fafc;
+        }
+
+        [data-testid="stSidebar"] .stButton button {
+            min-height: 2.35rem;
+            padding-left: 0.85rem;
+            padding-right: 0.85rem;
+            width: 100%;
         }
 
         .stButton button[kind="primary"] {
@@ -596,56 +673,70 @@ def apply_custom_style() -> None:
         }
 
         .stButton button[kind="primary"]:hover {
-            background: #2f2f2f;
-            border-color: #2f2f2f;
+            background: #343431;
+            border-color: #343431;
             color: #ffffff;
         }
 
         div[data-testid="stFileUploader"] section {
-            border-radius: 10px;
+            border-radius: 15px;
             border-color: var(--border);
-            background: #fafafa;
+            background: #f8fafc;
+            padding: 1.15rem;
+        }
+
+        div[data-testid="stFileUploader"] section:hover {
+            border-color: var(--border-strong);
+            background: #f1f5f9;
         }
 
         div[data-testid="stDataFrame"] {
             border: 1px solid var(--border);
-            border-radius: 8px;
+            border-radius: 14px;
             overflow: hidden;
         }
 
         .rq-label {
-            font-weight: 700;
-            color: #374151;
+            font-weight: 640;
+            color: var(--text-muted);
             padding-top: 0.45rem;
+        }
+
+        .rq-control-button {
+            margin-top: 0.15rem;
         }
 
         .section-note {
             color: var(--text-muted);
-            font-size: 0.9rem;
+            font-size: 0.86rem;
             margin-top: -0.35rem;
             margin-bottom: 0.75rem;
         }
 
         .app-hero {
-            margin-bottom: 1.4rem;
+            margin-bottom: 1.25rem;
+            max-width: 860px;
         }
 
         .app-kicker {
             display: inline-flex;
             align-items: center;
-            gap: 0.45rem;
+            gap: 0.5rem;
             color: var(--text-muted);
-            font-size: 0.92rem;
-            margin-bottom: 0.55rem;
+            font-size: 0.82rem;
+            font-weight: 560;
+            margin-bottom: 0.75rem;
+            letter-spacing: 0.01em;
         }
 
         .app-kicker svg,
         .panel-title svg,
+        .upload-title svg,
         .metric-card svg {
-            width: 18px;
-            height: 18px;
+            width: 17px;
+            height: 17px;
             stroke: currentColor;
-            stroke-width: 1.9;
+            stroke-width: 1.75;
             fill: none;
             stroke-linecap: round;
             stroke-linejoin: round;
@@ -654,70 +745,113 @@ def apply_custom_style() -> None:
         .workspace-panel {
             border: 1px solid var(--border);
             background: var(--panel-bg);
-            border-radius: 12px;
-            padding: 1.1rem 1.1rem 0.25rem;
-            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
-            margin-bottom: 1.1rem;
+            border-radius: 18px;
+            padding: 1.05rem;
+            box-shadow: var(--shadow);
+            min-height: 100%;
         }
 
         .panel-title {
             display: flex;
             align-items: center;
-            gap: 0.55rem;
-            font-weight: 720;
+            gap: 0.52rem;
+            font-weight: 660;
             color: var(--text-main);
-            margin-bottom: 0.2rem;
+            margin-bottom: 0.25rem;
         }
 
         .panel-subtitle {
             color: var(--text-muted);
-            font-size: 0.94rem;
-            margin-bottom: 1rem;
+            font-size: 0.9rem;
+            line-height: 1.45;
+            margin-bottom: 0.95rem;
         }
 
         .metric-grid {
             display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 0.75rem;
-            margin: 0.8rem 0 1rem;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.62rem;
+            margin: 0.85rem 0 0;
         }
 
         .metric-card {
             border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 0.82rem;
-            background: #fcfcfc;
-            min-height: 82px;
+            border-radius: 14px;
+            padding: 0.78rem;
+            background: #f8fafc;
+            min-height: 78px;
         }
 
         .metric-card svg {
             color: var(--accent);
-            margin-bottom: 0.35rem;
+            margin-bottom: 0.34rem;
         }
 
         .metric-label {
             color: var(--text-muted);
-            font-size: 0.78rem;
+            font-size: 0.76rem;
             line-height: 1.2;
         }
 
         .metric-value {
             color: var(--text-main);
-            font-weight: 720;
-            font-size: 1.05rem;
+            font-weight: 650;
+            font-size: 1.02rem;
             margin-top: 0.16rem;
             overflow-wrap: anywhere;
         }
 
-        .soft-divider {
-            height: 1px;
-            background: var(--border);
-            margin: 0.35rem 0 1rem;
+        .upload-shell {
+            border: 1px solid var(--border);
+            background: var(--panel-bg);
+            border-radius: 18px;
+            padding: 1.05rem 1.05rem 0.95rem;
+            box-shadow: var(--shadow);
+            margin-bottom: 1rem;
+        }
+
+        .upload-title {
+            display: flex;
+            align-items: center;
+            gap: 0.52rem;
+            font-weight: 660;
+            color: var(--text-main);
+            margin-bottom: 0.22rem;
+        }
+
+        .upload-subtitle {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            line-height: 1.45;
+            margin-bottom: 0.85rem;
+        }
+
+        .action-row-note {
+            color: var(--text-muted);
+            font-size: 0.84rem;
+            line-height: 1.45;
+            padding-top: 0.55rem;
+        }
+
+        .results-spacer {
+            margin-top: 1.15rem;
         }
 
         @media (max-width: 900px) {
             .metric-grid {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            .main .block-container {
+                padding-left: 1rem;
+                padding-right: 1rem;
+                padding-top: 1.4rem;
+            }
+
+            .upload-shell,
+            .workspace-panel {
+                padding: 0.9rem;
+                border-radius: 15px;
             }
         }
         </style>
@@ -744,7 +878,7 @@ def render_header() -> None:
         <div class="app-hero">
             <div class="app-kicker">{svg_icon("spark")} Systematic review extraction workspace</div>
             <h1>AI Systematic Review Extraction</h1>
-            <div style="color:#6b7280; max-width:760px; line-height:1.55;">
+            <div style="color:#64748b; max-width:760px; line-height:1.55; font-size:1rem;">
                 Batch extract article metadata, structured fields, and exhaustive research-question evidence from PDFs.
             </div>
         </div>
@@ -763,7 +897,7 @@ def render_workspace_panel(
         f"""
         <div class="workspace-panel">
             <div class="panel-title">{svg_icon("search")} Extraction run</div>
-            <div class="panel-subtitle">Current setup for the next batch extraction.</div>
+            <div class="panel-subtitle">A compact check of the current batch setup before you run extraction.</div>
             <div class="metric-grid">
                 <div class="metric-card">
                     {svg_icon("file")}
@@ -786,7 +920,18 @@ def render_workspace_panel(
                     <div class="metric-value">{escape(model)}</div>
                 </div>
             </div>
-            <div class="soft-divider"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_upload_intro() -> None:
+    st.markdown(
+        f"""
+        <div class="upload-shell">
+            <div class="upload-title">{svg_icon("file")} Source PDFs</div>
+            <div class="upload-subtitle">Upload the articles for this extraction run. Files stay local until each PDF is sent to the configured model provider.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -856,7 +1001,8 @@ def render_research_questions() -> list[str]:
             unsafe_allow_html=True,
         )
     with add_col:
-        st.button("+", key="add_rq", help="Add a research question", on_click=add_research_question)
+        st.markdown('<div class="rq-control-button"></div>', unsafe_allow_html=True)
+        st.button("＋", key="add_rq", help="Add a research question", on_click=add_research_question)
 
     for index in range(len(st.session_state.research_questions)):
         label_col, input_col, delete_col = st.columns([0.16, 0.68, 0.16], vertical_alignment="top")
@@ -873,7 +1019,7 @@ def render_research_questions() -> list[str]:
             )
         with delete_col:
             st.button(
-                "x",
+                "×",
                 key=f"delete_rq_{index}",
                 help=f"Delete RQ{index + 1}",
                 on_click=delete_research_question,
@@ -891,8 +1037,9 @@ def render_template() -> tuple[list[str], list[str]]:
     )
     field_text = st.text_area(
         "Structured fields, one per line",
-        value="Study design\nPopulation / sample\nIntervention or exposure\nComparator\nMain findings\nLimitations",
+        value="Study design\nPopulation / sample\nIntervention or exposure\nMain findings\nLimitations",
         height=150,
+        key="structured_fields_text",
     )
     questions = render_research_questions()
     return split_lines(field_text), questions
@@ -933,29 +1080,39 @@ def main() -> None:
 
     render_header()
 
-    uploaded_files = st.file_uploader(
-        "Upload PDF articles",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="Select multiple PDFs. Browser folder upload is not required in this first version.",
-    )
+    upload_col, summary_col = st.columns([0.64, 0.36], gap="medium", vertical_alignment="top")
+    with upload_col:
+        render_upload_intro()
+        uploaded_files = st.file_uploader(
+            "Upload PDF articles",
+            type=["pdf"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            help="Select multiple PDFs. Browser folder upload is not required in this first version.",
+        )
 
-    render_workspace_panel(
-        uploaded_count=len(uploaded_files or []),
-        field_count=len(fields),
-        question_count=len(questions),
-        model=model,
-    )
+    with summary_col:
+        render_workspace_panel(
+            uploaded_count=len(uploaded_files or []),
+            field_count=len(fields),
+            question_count=len(questions),
+            model=model,
+        )
 
-    col_run, col_clear = st.columns([1, 1])
-    with col_clear:
-        if st.button("Clear current results"):
-            st.session_state.results = []
-            st.session_state.errors = []
-            st.rerun()
+    col_run, col_clear, col_note = st.columns([0.22, 0.24, 0.54], vertical_alignment="center")
 
     with col_run:
         run = st.button("Run extraction", type="primary")
+    with col_clear:
+        if st.button("Clear results"):
+            st.session_state.results = []
+            st.session_state.errors = []
+            st.rerun()
+    with col_note:
+        st.markdown(
+            '<div class="action-row-note">Results export to a stable Excel workbook with article summary, evidence excerpts, and the exact prompt used.</div>',
+            unsafe_allow_html=True,
+        )
 
     if run:
         if not api_key:
@@ -991,6 +1148,7 @@ def main() -> None:
 
             status.success("Batch finished.")
 
+    st.markdown('<div class="results-spacer"></div>', unsafe_allow_html=True)
     render_results()
 
 
