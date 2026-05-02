@@ -8,6 +8,9 @@ The app is designed for personal research use:
 - Enter extraction fields and research questions in the browser.
 - Use an OpenAI-compatible API endpoint.
 - Export results as an Excel `.xlsx` workbook.
+- Upload RIS and PubMed NBIB citation files for pre-screening deduplication.
+- Mark clearly irrelevant citation records from user-provided exclusion criteria before full-text extraction.
+- Export citation screening results as an Excel audit file and two standard RIS files.
 - Extract research-question evidence with an exhaustive strategy rather than a fixed excerpt limit.
 - Run MMAT 2018 quality assessment as a separate step or together with extraction.
 - View, edit, and restore separate AI prompt templates for extraction and MMAT appraisal.
@@ -47,6 +50,30 @@ You can change the base URL later if you use another OpenAI-compatible provider.
 - MMAT response cells marked `No` or `Can't tell` are highlighted for review.
 - If the extraction fields and research questions stay the same, the summary sheet keeps the same column structure.
 - The Excel export includes extraction sheets, MMAT quality assessment sheets, and a `Methodology Prompt` sheet with the actual prompts used.
+- Citation screening exports use timestamped file names in `YYYYMMDD_HHMM` format.
+- Duplicate citation records are removed from the main screening result, but kept in the Excel duplicate log for traceability.
+- AI exclusion marking is conservative and only flags records; it does not delete AI-marked irrelevant records from the screening Excel.
+- The AI citation exclusion prompt is visible and editable in the sidebar.
+- AI exclusion marking runs in small batches and sends the original title and original abstract only, without truncating either field.
+
+## Citation Screening
+
+Use the `Citation screening` section to upload `.ris` and PubMed `.nbib` files before PDF extraction.
+
+The deduplication logic is:
+
+- Matching DOI or PMID means the later record is removed as a duplicate.
+- If DOI/PMID cannot identify a duplicate, title similarity must be at least 95%, and either abstract sequence similarity or abstract token overlap must be at least 95% before the later record is removed.
+- PubMed NBIB records are split by each `PMID-` record start.
+- The page and Excel export include an import log showing how many records were parsed from each uploaded citation file.
+
+The export buttons create:
+
+- `citation_screening_audit_YYYYMMDD_HHMM.xlsx`: screening results, duplicate log, and methodology details.
+- `deduplicated_ai_relevant_records_YYYYMMDD_HHMM.ris`: duplicates removed and AI-marked irrelevant records removed.
+- `deduplicated_all_records_YYYYMMDD_HHMM.ris`: duplicates removed, AI-marked irrelevant records retained.
+
+Use `Run deduplication + AI marking` when you want the app to perform both citation deduplication and conservative AI exclusion marking in one step.
 
 ## Quality Assessment / MMAT
 
