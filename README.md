@@ -14,6 +14,7 @@ The app is designed for personal research use:
 - Extract research-question evidence with an exhaustive strategy rather than a fixed excerpt limit.
 - Run MMAT 2018 quality assessment as a separate step or together with extraction.
 - View, edit, and restore separate AI prompt templates for extraction and MMAT appraisal.
+- Use a protected MMAT 2018 rubric inserted by the app, with the official manual available for download inside the interface.
 
 ## Setup
 
@@ -83,6 +84,8 @@ The MMAT workflow follows the 2018 tool:
 - The app asks the AI to choose one MMAT study design category for suitable empirical primary studies.
 - The app then asks only the five criteria for that chosen category.
 - The app uses `Yes`, `No`, and `Can't tell`; it does not calculate an overall MMAT score.
+- The editable MMAT prompt is only extra instruction text. The app always appends a protected MMAT 2018 rubric based on the bundled manual, so the official criteria are not removed by prompt edits.
+- The bundled manual is stored at `assets/MMAT__criteria-manual_2018-08-01_ENG.pdf` and can be downloaded from the MMAT prompt area.
 
 Use:
 
