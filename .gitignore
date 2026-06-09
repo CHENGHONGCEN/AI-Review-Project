@@ -22,6 +22,8 @@ htmlcov/
 # Local runtime data and generated outputs
 exports/
 uploads/
+citation_screening_autosave.json
+citation_screening_autosave.tmp
 *.log
 
 # Build and packaging outputs

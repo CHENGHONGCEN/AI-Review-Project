@@ -9,7 +9,7 @@ The app is designed for personal research use:
 - Use an OpenAI-compatible API endpoint.
 - Export results as an Excel `.xlsx` workbook.
 - Upload RIS and PubMed NBIB citation files for pre-screening deduplication.
-- Mark clearly irrelevant citation records from user-provided exclusion criteria before full-text extraction.
+- Mark citation records against user-provided inclusion criteria before full-text extraction.
 - Export citation screening results as an Excel audit file and two standard RIS files.
 - Extract research-question evidence with an exhaustive strategy rather than a fixed excerpt limit.
 - Run MMAT 2018 quality assessment as a separate step or together with extraction.
@@ -53,9 +53,9 @@ You can change the base URL later if you use another OpenAI-compatible provider.
 - The Excel export includes extraction sheets, MMAT quality assessment sheets, and a `Methodology Prompt` sheet with the actual prompts used.
 - Citation screening exports use timestamped file names in `YYYYMMDD_HHMM` format.
 - Duplicate citation records are removed from the main screening result, but kept in the Excel duplicate log for traceability.
-- AI exclusion marking is conservative and only flags records; it does not delete AI-marked irrelevant records from the screening Excel.
-- The AI citation exclusion prompt is visible and editable in the sidebar.
-- AI exclusion marking runs in small batches and sends the original title and original abstract only, without truncating either field.
+- AI inclusion marking is conservative and only flags records; it does not delete records from the screening Excel.
+- The AI citation inclusion prompt is visible and editable in the sidebar.
+- AI inclusion marking runs in small batches and sends the original title and original abstract only, without truncating either field.
 
 ## Citation Screening
 
@@ -71,10 +71,10 @@ The deduplication logic is:
 The export buttons create:
 
 - `citation_screening_audit_YYYYMMDD_HHMM.xlsx`: screening results, duplicate log, and methodology details.
-- `deduplicated_ai_relevant_records_YYYYMMDD_HHMM.ris`: duplicates removed and AI-marked irrelevant records removed.
-- `deduplicated_all_records_YYYYMMDD_HHMM.ris`: duplicates removed, AI-marked irrelevant records retained.
+- `ai_suggested_inclusion_records_YYYYMMDD_HHMM.ris`: records marked as matching or potentially matching the inclusion criteria.
+- `all_screening_records_YYYYMMDD_HHMM.ris`: all current screening records.
 
-Use `Run deduplication + AI marking` when you want the app to perform both citation deduplication and conservative AI exclusion marking in one step.
+Use `AI mark` when you want to mark the current uploaded records without deduplication first. Use `Deduplicate + AI mark` when you want the app to perform citation deduplication and AI inclusion marking in one step.
 
 ## Quality Assessment / MMAT
 

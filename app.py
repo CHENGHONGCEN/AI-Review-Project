@@ -28,6 +28,7 @@ CITATION_AI_BATCH_CHAR_BUDGET = 30000
 CITATION_AI_BATCH_DELAY_SECONDS = 3
 APP_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = APP_DIR / "assets"
+CITATION_AUTOSAVE_PATH = APP_DIR / "citation_screening_autosave.json"
 MMAT_MANUAL_VERSION = "MMAT 2018 criteria manual, 2018-08-01"
 MMAT_MANUAL_FILENAME = "MMAT__criteria-manual_2018-08-01_ENG.pdf"
 MMAT_MANUAL_PATH = ASSETS_DIR / MMAT_MANUAL_FILENAME
@@ -251,19 +252,33 @@ Core rules:
 - Mark confidence as "low" when the answer depends on unclear reporting, missing text, poor PDF quality, or difficult study design classification.
 """.strip()
 
-DEFAULT_EXCLUSION_PROMPT_TEMPLATE = """
+DEFAULT_INCLUSION_PROMPT_TEMPLATE = """
 You are helping with title and abstract screening for a systematic review.
 
-Your task is to review citation metadata only. You must be very conservative.
+Your task is to assess whether each citation appears potentially eligible for inclusion
+based on the user's inclusion and exclusion criteria.
 
-Rules:
-- Use only the title, abstract, year, journal, DOI, PMID, and authors provided in the JSON input.
-- Apply only the exclusion criteria provided by the user.
-- Mark ai_suggested_exclusion as true only when the title and/or abstract clearly show the record should be excluded.
-- If the evidence is missing, indirect, borderline, or uncertain, mark ai_suggested_exclusion as false.
-- Do not exclude records just because the abstract is unavailable.
+Evidence source:
+- Use the title and abstract as the main evidence for the inclusion decision.
+- The JSON input contains record_id, title, and abstract; record_id is only for matching the output back to the input.
+- Do not use outside knowledge, assumptions, or criteria not provided by the user.
+
+Decision rules:
+- Apply only the inclusion and exclusion criteria provided by the user.
+- Do not add extra inclusion or exclusion rules that conflict with the user's criteria.
+- Mark ai_decision as "include" only when the title and/or abstract suggest that all inclusion criteria are met and no exclusion criterion is met.
+- Mark ai_decision as "exclude" when the title and/or abstract clearly suggest the record does not meet at least one inclusion criterion, or clearly suggest that at least one exclusion criterion is met.
+- Mark ai_decision as "unsure" when one or more criteria are unclear from the title/abstract, but the record may still be eligible after full-text review.
+- Mark ai_suggested_inclusion as true for "include" and "unsure". Mark it as false only for "exclude".
+- In matched_criteria, write only the matching inclusion criterion numbers, separated by commas with no spaces, such as "1,2,3". If none are matched, write an empty string.
+- In matched_exclusion_criteria, write only the matching exclusion criterion numbers, separated by commas with no spaces, such as "1,2". If none are matched, write an empty string.
+- In reason, briefly explain the ai_decision and, where possible, quote exact words from the abstract in double quotation marks as evidence.
+- If the abstract is unavailable, rely on the title and mark needs_human_review as true unless the title alone is enough for the decision.
 - The output is only a flag for human review. The user will make the final decision.
 - Keep reasons short and plain.
+
+Inclusion criteria:
+{inclusion_criteria}
 
 Exclusion criteria:
 {exclusion_criteria}
@@ -447,7 +462,7 @@ MMAT_SCHEMA: dict[str, Any] = {
 }
 
 
-EXCLUSION_MARKING_SCHEMA: dict[str, Any] = {
+INCLUSION_MARKING_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
@@ -458,16 +473,24 @@ EXCLUSION_MARKING_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
                 "properties": {
                     "record_id": {"type": "string"},
-                    "ai_suggested_exclusion": {"type": "boolean"},
+                    "ai_decision": {"type": "string", "enum": ["include", "exclude", "unsure"]},
+                    "suggested_action": {"type": "string"},
+                    "ai_suggested_inclusion": {"type": "boolean"},
                     "matched_criteria": {"type": "string"},
+                    "matched_exclusion_criteria": {"type": "string"},
+                    "exclusion_reason": {"type": "string"},
                     "reason": {"type": "string"},
                     "evidence": {"type": "string"},
                     "needs_human_review": {"type": "boolean"},
                 },
                 "required": [
                     "record_id",
-                    "ai_suggested_exclusion",
+                    "ai_decision",
+                    "suggested_action",
+                    "ai_suggested_inclusion",
                     "matched_criteria",
+                    "matched_exclusion_criteria",
+                    "exclusion_reason",
                     "reason",
                     "evidence",
                     "needs_human_review",
@@ -479,8 +502,39 @@ EXCLUSION_MARKING_SCHEMA: dict[str, Any] = {
 }
 
 
+CRITERION_NUMBER_RE = re.compile(
+    r"^\s*[（(]?\s*(\d{1,3})\s*[\.\．、\)）]\s*(.*)$"
+)
+
+
 def split_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def parse_criteria_text(text: str) -> list[str]:
+    lines = [line.strip() for line in text.splitlines()]
+    items: list[str] = []
+    current: list[str] = []
+    saw_numbered_item = False
+
+    for line in lines:
+        if not line:
+            continue
+        match = CRITERION_NUMBER_RE.match(line)
+        if match:
+            if current:
+                items.append(normalize_whitespace(" ".join(current)))
+            current = [match.group(2).strip()]
+            saw_numbered_item = True
+        elif saw_numbered_item:
+            current.append(line)
+        else:
+            items.append(line)
+
+    if current:
+        items.append(normalize_whitespace(" ".join(current)))
+
+    return [item for item in items if item]
 
 
 def decode_uploaded_text(uploaded_file: Any) -> str:
@@ -491,6 +545,12 @@ def decode_uploaded_text(uploaded_file: Any) -> str:
         except UnicodeDecodeError:
             continue
     return content.decode("utf-8", errors="replace")
+
+
+def remove_excel_control_chars(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return re.sub(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]", "", value)
 
 
 def normalize_whitespace(value: Any) -> str:
@@ -696,8 +756,13 @@ def citation_from_tags(
         "year": year,
         "journal": journal,
         "raw_tags": tags,
+        "ai_decision": "unsure",
+        "ai_suggested_action": "human review",
+        "ai_suggested_inclusion": True,
         "ai_suggested_exclusion": False,
         "ai_matched_criteria": "",
+        "ai_matched_exclusion_criteria": "",
+        "ai_exclusion_reason": "",
         "ai_reason": "",
         "ai_evidence": "",
         "needs_human_review": False,
@@ -854,31 +919,43 @@ def citation_to_ai_payload(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def make_exclusion_prompt(
+def make_inclusion_prompt(
     records: list[dict[str, Any]],
+    inclusion_criteria: list[str],
     exclusion_criteria: list[str],
     prompt_template: str,
 ) -> str:
-    criteria_text = "\n".join(f"- {criterion}" for criterion in exclusion_criteria)
+    inclusion_criteria_text = "\n".join(
+        f"{index}. {criterion}"
+        for index, criterion in enumerate(inclusion_criteria, start=1)
+    )
+    exclusion_criteria_text = "\n".join(
+        f"{index}. {criterion}"
+        for index, criterion in enumerate(exclusion_criteria, start=1)
+    )
     records_json = json.dumps(
         [citation_to_ai_payload(record) for record in records],
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    template = prompt_template.strip() or DEFAULT_EXCLUSION_PROMPT_TEMPLATE
+    template = prompt_template.strip() or DEFAULT_INCLUSION_PROMPT_TEMPLATE
+    if "{inclusion_criteria}" not in template:
+        template = f"{template}\n\nInclusion criteria:\n{{inclusion_criteria}}"
     if "{exclusion_criteria}" not in template:
         template = f"{template}\n\nExclusion criteria:\n{{exclusion_criteria}}"
     if "{records_json}" not in template:
         template = f"{template}\n\nCitation records:\n{{records_json}}"
     return (
-        template.replace("{exclusion_criteria}", criteria_text)
+        template.replace("{inclusion_criteria}", inclusion_criteria_text or "not provided")
+        .replace("{exclusion_criteria}", exclusion_criteria_text or "not provided")
         .replace("{records_json}", records_json)
         .strip()
     )
 
 
-def mark_citation_exclusions(
+def mark_citation_inclusions(
     records: list[dict[str, Any]],
+    inclusion_criteria: list[str],
     exclusion_criteria: list[str],
     api_key: str,
     base_url: str,
@@ -886,7 +963,12 @@ def mark_citation_exclusions(
     prompt_template: str,
 ) -> tuple[list[dict[str, Any]], str]:
     client = OpenAI(api_key=api_key, base_url=base_url.rstrip("/"))
-    prompt = make_exclusion_prompt(records, exclusion_criteria, prompt_template)
+    prompt = make_inclusion_prompt(
+        records,
+        inclusion_criteria,
+        exclusion_criteria,
+        prompt_template,
+    )
 
     response = client.responses.create(
         model=model,
@@ -899,9 +981,9 @@ def mark_citation_exclusions(
         text={
             "format": {
                 "type": "json_schema",
-                "name": "citation_exclusion_marking",
+                "name": "citation_inclusion_marking",
                 "strict": True,
-                "schema": EXCLUSION_MARKING_SCHEMA,
+                "schema": INCLUSION_MARKING_SCHEMA,
             }
         },
     )
@@ -914,14 +996,42 @@ def mark_citation_exclusions(
     }
     for record in records:
         decision = decisions.get(record.get("record_id", ""), {})
-        record["ai_suggested_exclusion"] = clean_bool(
-            decision.get("ai_suggested_exclusion"),
-            False,
+        ai_decision = clean_text(decision.get("ai_decision"), "").casefold()
+        if ai_decision not in {"include", "exclude", "unsure"}:
+            ai_decision = (
+                "include"
+                if clean_bool(decision.get("ai_suggested_inclusion"), True)
+                else "exclude"
+            )
+        suggested_inclusion = ai_decision in {"include", "unsure"}
+        suggested_action = clean_text(decision.get("suggested_action"), "")
+        if not suggested_action:
+            suggested_action = {
+                "include": "keep for full-text review",
+                "unsure": "human review",
+                "exclude": "exclude",
+            }[ai_decision]
+        record["ai_decision"] = ai_decision
+        record["ai_suggested_action"] = suggested_action
+        record["ai_suggested_inclusion"] = suggested_inclusion
+        record["ai_suggested_exclusion"] = ai_decision == "exclude"
+        record["ai_matched_criteria"] = format_matched_criterion_numbers(
+            decision.get("matched_criteria"),
+            len(inclusion_criteria),
         )
-        record["ai_matched_criteria"] = clean_text(decision.get("matched_criteria"), "")
+        record["ai_matched_exclusion_criteria"] = clean_text(
+            format_matched_criterion_numbers(
+                decision.get("matched_exclusion_criteria"),
+                len(exclusion_criteria),
+            ),
+        )
+        record["ai_exclusion_reason"] = clean_text(decision.get("exclusion_reason"), "")
         record["ai_reason"] = clean_text(decision.get("reason"), "")
         record["ai_evidence"] = clean_text(decision.get("evidence"), "")
-        record["needs_human_review"] = clean_bool(decision.get("needs_human_review"), False)
+        record["needs_human_review"] = clean_bool(
+            decision.get("needs_human_review"),
+            ai_decision == "unsure",
+        )
     return records, prompt
 
 
@@ -955,30 +1065,41 @@ def batch_citations_for_ai(records: list[dict[str, Any]]) -> list[list[dict[str,
     return batches
 
 
-def citation_exclusion_prompt_note(
+def citation_inclusion_prompt_note(
     prompt_template: str,
+    inclusion_criteria: list[str],
     exclusion_criteria: list[str],
     total_records: int,
 ) -> str:
-    criteria_text = "\n".join(f"- {criterion}" for criterion in exclusion_criteria)
+    inclusion_criteria_text = "\n".join(
+        f"{index}. {criterion}"
+        for index, criterion in enumerate(inclusion_criteria, start=1)
+    )
+    exclusion_criteria_text = "\n".join(
+        f"{index}. {criterion}"
+        for index, criterion in enumerate(exclusion_criteria, start=1)
+    )
     return "\n\n".join(
         [
-            "AI citation exclusion marking was run in batches to avoid token-per-minute limits.",
+            "AI citation inclusion marking was run in batches to avoid token-per-minute limits.",
             f"Maximum batch size: {CITATION_AI_MAX_BATCH_RECORDS} records",
             f"Approximate batch character budget: {CITATION_AI_BATCH_CHAR_BUDGET}",
             "AI input fields: original title and original abstract only",
             "No title or abstract text was truncated for AI marking.",
             f"Total records sent for AI marking: {total_records}",
+            "Inclusion criteria:",
+            inclusion_criteria_text or "not provided",
             "Exclusion criteria:",
-            criteria_text or "not provided",
+            exclusion_criteria_text or "not provided",
             "Prompt template used:",
-            prompt_template.strip() or DEFAULT_EXCLUSION_PROMPT_TEMPLATE,
+            prompt_template.strip() or DEFAULT_INCLUSION_PROMPT_TEMPLATE,
         ]
     )
 
 
-def mark_citation_exclusions_batched(
+def mark_citation_inclusions_batched(
     records: list[dict[str, Any]],
+    inclusion_criteria: list[str],
     exclusion_criteria: list[str],
     api_key: str,
     base_url: str,
@@ -986,9 +1107,15 @@ def mark_citation_exclusions_batched(
     prompt_template: str,
     status: Any | None = None,
     progress: Any | None = None,
+    checkpoint: Any | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     if not records:
-        return records, citation_exclusion_prompt_note(prompt_template, exclusion_criteria, 0)
+        return records, citation_inclusion_prompt_note(
+            prompt_template,
+            inclusion_criteria,
+            exclusion_criteria,
+            0,
+        )
 
     batches = batch_citations_for_ai(records)
     marked_records: list[dict[str, Any]] = []
@@ -1000,8 +1127,9 @@ def mark_citation_exclusions_batched(
                 f"AI marking citation batch {batch_index}/{total_batches} "
                 f"({len(batch)} records)"
             )
-        marked_batch, _prompt_used = mark_citation_exclusions(
+        marked_batch, _prompt_used = mark_citation_inclusions(
             records=batch,
+            inclusion_criteria=inclusion_criteria,
             exclusion_criteria=exclusion_criteria,
             api_key=api_key,
             base_url=base_url,
@@ -1009,13 +1137,21 @@ def mark_citation_exclusions_batched(
             prompt_template=prompt_template,
         )
         marked_records.extend(marked_batch)
+        if checkpoint is not None:
+            remaining_records = [
+                record
+                for remaining_batch in batches[batch_index:]
+                for record in remaining_batch
+            ]
+            checkpoint(marked_records + remaining_records)
         if progress is not None:
             progress.progress(batch_index / total_batches)
         if batch_index < total_batches and CITATION_AI_BATCH_DELAY_SECONDS > 0:
             sleep(CITATION_AI_BATCH_DELAY_SECONDS)
 
-    return marked_records, citation_exclusion_prompt_note(
+    return marked_records, citation_inclusion_prompt_note(
         prompt_template,
+        inclusion_criteria,
         exclusion_criteria,
         len(records),
     )
@@ -1479,51 +1615,177 @@ def mmat_result_to_evidence_rows(result: dict[str, Any]) -> list[dict[str, str]]
     return rows
 
 
-def citation_to_screening_row(record: dict[str, Any]) -> dict[str, str]:
+def citation_suggests_inclusion(record: dict[str, Any]) -> bool:
+    ai_decision = clean_text(record.get("ai_decision"), "").casefold()
+    if ai_decision in {"include", "unsure"}:
+        return True
+    if ai_decision == "exclude":
+        return False
+    if "ai_suggested_inclusion" in record:
+        return clean_bool(record.get("ai_suggested_inclusion"), True)
+    return not clean_bool(record.get("ai_suggested_exclusion"), False)
+
+
+def format_ai_suggestion(value: Any) -> str:
+    ai_decision = clean_text(value, "unsure").casefold()
+    if ai_decision == "include":
+        return "Include"
+    if ai_decision == "exclude":
+        return "Exclude"
+    return "Unsure"
+
+
+def format_matched_criterion_numbers(value: Any, criterion_count: int) -> str:
+    if criterion_count <= 0:
+        return ""
+    numbers: list[str] = []
+    for match in re.finditer(r"\b\d{1,3}\b", clean_text(value, "")):
+        number = int(match.group(0))
+        if 1 <= number <= criterion_count and str(number) not in numbers:
+            numbers.append(str(number))
+    return ",".join(numbers)
+
+
+def citation_to_screening_row(
+    record: dict[str, Any],
+    inclusion_criteria_count: int = 0,
+    exclusion_criteria_count: int = 0,
+) -> dict[str, str]:
     return {
-        "record_id": clean_text(record.get("record_id"), ""),
-        "title": clean_text(record.get("title"), ""),
-        "abstract": clean_text(record.get("abstract"), ""),
-        "doi": clean_text(record.get("doi"), ""),
-        "pmid": clean_text(record.get("pmid"), ""),
-        "authors": "; ".join(record.get("authors", [])),
-        "year": clean_text(record.get("year"), ""),
-        "journal": clean_text(record.get("journal"), ""),
-        "source_file": clean_text(record.get("source_file"), ""),
-        "source_format": clean_text(record.get("source_format"), ""),
-        "AI suggested exclusion": "Yes" if record.get("ai_suggested_exclusion") else "No",
-        "matched exclusion criteria": clean_text(record.get("ai_matched_criteria"), ""),
-        "AI reason": clean_text(record.get("ai_reason"), ""),
-        "AI evidence": clean_text(record.get("ai_evidence"), ""),
-        "needs human review": "Yes" if record.get("needs_human_review") else "No",
+        "Title": clean_text(record.get("title"), ""),
+        "Abstract": clean_text(record.get("abstract"), ""),
+        "AI suggestion": format_ai_suggestion(record.get("ai_decision")),
+        "Reason": clean_text(record.get("ai_reason"), ""),
+        "matched inclusion criteria": format_matched_criterion_numbers(
+            record.get("ai_matched_criteria"),
+            inclusion_criteria_count,
+        ),
+        "matched exclusion criteria": format_matched_criterion_numbers(
+            record.get("ai_matched_exclusion_criteria"),
+            exclusion_criteria_count,
+        ),
+        "needs human review": "YES" if record.get("needs_human_review") else "NO",
     }
+
+
+def citation_state_payload() -> dict[str, Any]:
+    return {
+        "citation_records": st.session_state.get("citation_records", []),
+        "citation_duplicate_log": st.session_state.get("citation_duplicate_log", []),
+        "citation_import_log": st.session_state.get("citation_import_log", []),
+        "citation_errors": st.session_state.get("citation_errors", []),
+        "citation_ai_prompt_used": st.session_state.get("citation_ai_prompt_used", ""),
+        "citation_imported_count": int(st.session_state.get("citation_imported_count", 0)),
+        "citation_export_timestamp": st.session_state.get("citation_export_timestamp", ""),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def apply_citation_state(payload: dict[str, Any]) -> None:
+    st.session_state.citation_records = payload.get("citation_records", [])
+    st.session_state.citation_duplicate_log = payload.get("citation_duplicate_log", [])
+    st.session_state.citation_import_log = payload.get("citation_import_log", [])
+    st.session_state.citation_errors = payload.get("citation_errors", [])
+    st.session_state.citation_ai_prompt_used = payload.get("citation_ai_prompt_used", "")
+    st.session_state.citation_imported_count = int(payload.get("citation_imported_count", 0) or 0)
+    st.session_state.citation_export_timestamp = payload.get("citation_export_timestamp", "")
+
+
+def save_citation_state() -> None:
+    temp_path = CITATION_AUTOSAVE_PATH.with_suffix(".tmp")
+    temp_path.write_text(
+        json.dumps(citation_state_payload(), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temp_path.replace(CITATION_AUTOSAVE_PATH)
+
+
+def load_citation_state() -> dict[str, Any] | None:
+    if not CITATION_AUTOSAVE_PATH.exists():
+        return None
+    try:
+        payload = json.loads(CITATION_AUTOSAVE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def restore_citation_state_if_needed() -> None:
+    if st.session_state.get("citation_records"):
+        return
+    payload = load_citation_state()
+    if not payload or not payload.get("citation_records"):
+        return
+    apply_citation_state(payload)
+
+
+def clear_citation_state() -> None:
+    apply_citation_state(
+        {
+            "citation_records": [],
+            "citation_duplicate_log": [],
+            "citation_import_log": [],
+            "citation_errors": [],
+            "citation_ai_prompt_used": "",
+            "citation_imported_count": 0,
+            "citation_export_timestamp": "",
+        }
+    )
+    save_citation_state()
+
+
+def citation_autosave_summary() -> str:
+    payload = load_citation_state()
+    if not payload or not payload.get("saved_at"):
+        return ""
+    record_count = len(payload.get("citation_records", []) or [])
+    return f"Autosaved {record_count} citation records at {payload['saved_at']}."
+
+
+def persist_citation_records(
+    records: list[dict[str, Any]],
+    ai_prompt_used: str | None = None,
+    export_timestamp: str | None = None,
+) -> None:
+    st.session_state.citation_records = records
+    if ai_prompt_used is not None:
+        st.session_state.citation_ai_prompt_used = ai_prompt_used
+    if export_timestamp is not None:
+        st.session_state.citation_export_timestamp = export_timestamp
+    save_citation_state()
 
 
 def build_screening_excel_export(
     records: list[dict[str, Any]],
     duplicate_log: list[dict[str, Any]],
     import_log: list[dict[str, Any]],
+    inclusion_criteria: list[str],
     exclusion_criteria: list[str],
     ai_prompt_used: str,
 ) -> bytes:
     workbook = Workbook()
     results_sheet = workbook.active
     results_sheet.title = "Screening Results"
-    screening_rows = [citation_to_screening_row(record) for record in records]
+    screening_rows = [
+        citation_to_screening_row(
+            record,
+            inclusion_criteria_count=len(inclusion_criteria),
+            exclusion_criteria_count=len(exclusion_criteria),
+        )
+        for record in records
+    ]
     if screening_rows:
         add_rows_to_sheet(results_sheet, screening_rows)
     else:
         results_sheet.append(
             [
-                "record_id",
-                "title",
-                "abstract",
-                "doi",
-                "pmid",
-                "authors",
-                "year",
-                "journal",
-                "AI suggested exclusion",
+                "Title",
+                "Abstract",
+                "AI suggestion",
+                "Reason",
+                "matched inclusion criteria",
+                "matched exclusion criteria",
+                "needs human review",
             ]
         )
     tune_excel_sheet(results_sheet)
@@ -1555,9 +1817,10 @@ def build_screening_excel_export(
     methodology_sheet.append(["Generated", datetime.now().strftime("%Y-%m-%d %H:%M")])
     methodology_sheet.append(["Deduplication rule 1", "If DOI or PMID matches, the later record is removed as duplicate."])
     methodology_sheet.append(["Deduplication rule 2", "If DOI and PMID are missing, title similarity >= 95% and abstract similarity >= 95% removes the later record as duplicate."])
+    methodology_sheet.append(["Inclusion criteria", "\n".join(inclusion_criteria) if inclusion_criteria else "not provided"])
     methodology_sheet.append(["Exclusion criteria", "\n".join(exclusion_criteria) if exclusion_criteria else "not provided"])
     methodology_sheet.append(["AI marking prompt used", ai_prompt_used or "not run"])
-    methodology_sheet.append(["AI deletion note", "AI-marked irrelevant records are not deleted from the screening Excel."])
+    methodology_sheet.append(["AI deletion note", "Records not matching the AI inclusion suggestion are not deleted from the screening Excel."])
     tune_excel_sheet(methodology_sheet)
     methodology_sheet.column_dimensions["A"].width = 26
     methodology_sheet.column_dimensions["B"].width = 100
@@ -1612,7 +1875,7 @@ def add_rows_to_sheet(sheet: Any, rows: list[dict[str, str]]) -> None:
                 headers.append(key)
     sheet.append(headers)
     for row in rows:
-        sheet.append([row.get(header, "") for header in headers])
+        sheet.append([remove_excel_control_chars(row.get(header, "")) for header in headers])
 
 
 def tune_excel_sheet(sheet: Any) -> None:
@@ -1808,6 +2071,7 @@ def initialise_state() -> None:
         "prompt_template_editor",
         "mmat_prompt_template_editor",
         "citation_exclusion_prompt_editor",
+        "citation_inclusion_prompt_editor",
     ):
         st.session_state.pop(stale_key, None)
     st.session_state.setdefault("results", [])
@@ -1821,7 +2085,7 @@ def initialise_state() -> None:
     st.session_state.setdefault("citation_ai_prompt_used", "")
     st.session_state.setdefault("citation_imported_count", 0)
     st.session_state.setdefault("citation_export_timestamp", "")
-    st.session_state.setdefault("citation_exclusion_prompt_template", DEFAULT_EXCLUSION_PROMPT_TEMPLATE)
+    st.session_state.setdefault("citation_inclusion_prompt_template", DEFAULT_INCLUSION_PROMPT_TEMPLATE)
     st.session_state.setdefault("research_questions", [""])
     st.session_state.setdefault("prompt_template", DEFAULT_PROMPT_TEMPLATE)
     st.session_state.setdefault("mmat_prompt_template", DEFAULT_MMAT_PROMPT_TEMPLATE)
@@ -2243,7 +2507,7 @@ def render_header() -> None:
             <div class="app-kicker">{svg_icon("spark")} AQEReview systematic review workspace</div>
             <h1>Citation Screening, Evidence Extraction & Quality Appraisal</h1>
             <div style="color:#64748b; max-width:760px; line-height:1.55; font-size:1rem;">
-                Deduplicate RIS/NBIB records, flag clearly irrelevant citations, then extract PDF evidence and run MMAT 2018 quality assessment.
+                Deduplicate RIS/NBIB records, mark citations against inclusion criteria, then extract PDF evidence and run MMAT 2018 quality assessment.
             </div>
         </div>
         """,
@@ -2330,8 +2594,8 @@ def restore_default_mmat_prompt() -> None:
     st.session_state.mmat_prompt_template = DEFAULT_MMAT_PROMPT_TEMPLATE
 
 
-def restore_default_citation_exclusion_prompt() -> None:
-    st.session_state.citation_exclusion_prompt_template = DEFAULT_EXCLUSION_PROMPT_TEMPLATE
+def restore_default_citation_inclusion_prompt() -> None:
+    st.session_state.citation_inclusion_prompt_template = DEFAULT_INCLUSION_PROMPT_TEMPLATE
 
 
 def saved_prompt_value(saved_key: str, default_value: str) -> str:
@@ -2380,45 +2644,45 @@ def render_prompt_editor() -> str:
         return render_prompt_editor_content()
 
 
-def render_citation_exclusion_prompt_editor_content() -> str:
+def render_citation_inclusion_prompt_editor_content() -> str:
     saved_value = saved_prompt_value(
-        "citation_exclusion_prompt_template",
-        DEFAULT_EXCLUSION_PROMPT_TEMPLATE,
+        "citation_inclusion_prompt_template",
+        DEFAULT_INCLUSION_PROMPT_TEMPLATE,
     )
     st.markdown(
-        '<div class="section-note">Edit the prompt used to mark clearly irrelevant citation records. The placeholders are filled automatically before the metadata is sent to the model.</div>',
+        '<div class="section-note">Edit the prompt used to mark citation records against your inclusion and exclusion criteria. The placeholders are filled automatically before the title and abstract are sent to the model.</div>',
         unsafe_allow_html=True,
     )
     st.button(
-        "Restore default citation exclusion prompt",
-        key="restore_citation_exclusion_prompt",
-        help="Reset the citation exclusion prompt template to the built-in default.",
-        on_click=restore_default_citation_exclusion_prompt,
+        "Restore default citation inclusion prompt",
+        key="restore_citation_inclusion_prompt",
+        help="Reset the citation inclusion prompt template to the built-in default.",
+        on_click=restore_default_citation_inclusion_prompt,
     )
     prompt_template = st.text_area(
-        "Citation exclusion prompt template",
+        "Citation inclusion prompt template",
         value=saved_value,
         height=360,
-        help="Keep {exclusion_criteria} and {records_json} if you want the app to insert the current criteria and citation records at those positions.",
-        key="citation_exclusion_prompt_text_area",
+        help="Keep {inclusion_criteria}, {exclusion_criteria}, and {records_json} if you want the app to insert the current criteria and citation records at those positions.",
+        key="citation_inclusion_prompt_text_area",
     )
-    st.session_state.citation_exclusion_prompt_template = prompt_template
+    st.session_state.citation_inclusion_prompt_template = prompt_template
     missing = [
         placeholder
-        for placeholder in ("{exclusion_criteria}", "{records_json}")
+        for placeholder in ("{inclusion_criteria}", "{exclusion_criteria}", "{records_json}")
         if placeholder not in prompt_template
     ]
     if missing:
         st.info(
-            "Missing placeholders will be appended automatically when AI exclusion marking runs: "
+            "Missing placeholders will be appended automatically when AI inclusion marking runs: "
             + ", ".join(missing)
         )
     return prompt_template
 
 
-def render_citation_exclusion_prompt_editor() -> str:
-    with st.expander("Citation exclusion prompt", expanded=False):
-        return render_citation_exclusion_prompt_editor_content()
+def render_citation_inclusion_prompt_editor() -> str:
+    with st.expander("Citation inclusion prompt", expanded=False):
+        return render_citation_inclusion_prompt_editor_content()
 
 
 def render_mmat_prompt_editor_content() -> str:
@@ -2472,7 +2736,7 @@ def render_mmat_prompt_editor() -> str:
 
 
 def render_prompt_settings() -> tuple[str, str, str]:
-    citation_exclusion_prompt_template = st.session_state.citation_exclusion_prompt_template
+    citation_inclusion_prompt_template = st.session_state.citation_inclusion_prompt_template
     prompt_template = st.session_state.prompt_template
     mmat_prompt_template = st.session_state.mmat_prompt_template
     with st.expander("Prompt settings", expanded=False):
@@ -2480,19 +2744,21 @@ def render_prompt_settings() -> tuple[str, str, str]:
             '<div class="section-note">Choose one AI step to edit. The other prompts stay saved in the background.</div>',
             unsafe_allow_html=True,
         )
+        if st.session_state.get("prompt_editor_choice") == "Citation exclusion":
+            st.session_state.prompt_editor_choice = "Citation inclusion"
         prompt_choice = st.selectbox(
             "Prompt to edit",
-            ["Citation exclusion", "Article extraction", "MMAT assessment"],
+            ["Citation inclusion", "Article extraction", "MMAT assessment"],
             key="prompt_editor_choice",
             label_visibility="collapsed",
         )
-        if prompt_choice == "Citation exclusion":
-            citation_exclusion_prompt_template = render_citation_exclusion_prompt_editor_content()
+        if prompt_choice == "Citation inclusion":
+            citation_inclusion_prompt_template = render_citation_inclusion_prompt_editor_content()
         elif prompt_choice == "Article extraction":
             prompt_template = render_prompt_editor_content()
         else:
             mmat_prompt_template = render_mmat_prompt_editor_content()
-    return citation_exclusion_prompt_template, prompt_template, mmat_prompt_template
+    return citation_inclusion_prompt_template, prompt_template, mmat_prompt_template
 
 
 def add_research_question() -> None:
@@ -2679,24 +2945,36 @@ def render_citation_metrics() -> None:
     imported_count = int(st.session_state.get("citation_imported_count", 0))
     records = st.session_state.get("citation_records", [])
     duplicate_count = len(st.session_state.get("citation_duplicate_log", []))
-    ai_irrelevant_count = sum(1 for record in records if record.get("ai_suggested_exclusion"))
+    ai_not_included_count = sum(1 for record in records if not citation_suggests_inclusion(record))
 
     metric_col_1, metric_col_2, metric_col_3, metric_col_4 = st.columns(4)
     metric_col_1.metric("Imported records", imported_count)
     metric_col_2.metric("Duplicates removed", duplicate_count)
-    metric_col_3.metric("Records after deduplication", len(records))
-    metric_col_4.metric("AI-marked irrelevant records", ai_irrelevant_count)
+    metric_col_3.metric("Records in screening set", len(records))
+    metric_col_4.metric("AI-marked outside inclusion", ai_not_included_count)
+
+
+def render_criteria_preview(label: str, criteria: list[str]) -> None:
+    st.markdown(f"**Recognized {label}**")
+    if not criteria:
+        st.caption("No criteria recognized yet.")
+        return
+    preview_rows = [
+        {"No.": index, "Criterion": criterion}
+        for index, criterion in enumerate(criteria, start=1)
+    ]
+    st.dataframe(pd.DataFrame(preview_rows), width="stretch", hide_index=True)
 
 
 def render_citation_screening(
     api_key: str,
     base_url: str,
     model: str,
-    exclusion_prompt_template: str,
+    inclusion_prompt_template: str,
 ) -> None:
     st.subheader("Citation screening")
     st.markdown(
-        '<div class="section-note">Upload RIS or PubMed NBIB files, remove duplicates, and conservatively mark clearly irrelevant records before full-text extraction.</div>',
+        '<div class="section-note">Upload RIS or PubMed NBIB files, optionally remove duplicates, and mark records against your inclusion and exclusion criteria before full-text extraction.</div>',
         unsafe_allow_html=True,
     )
     citation_files = st.file_uploader(
@@ -2706,13 +2984,28 @@ def render_citation_screening(
         key="citation_file_uploader",
         help="You can upload files from multiple databases. PubMed Citation Manager .nbib files are supported.",
     )
+    inclusion_text = st.text_area(
+        "Inclusion Criteria",
+        key="citation_inclusion_criteria",
+        height=120,
+        placeholder="1. Empirical study\n2. About the target population\n3. Reports relevant outcomes",
+        help="Use numbered criteria for long items. Wrapped lines are treated as part of the previous numbered criterion.",
+    )
     exclusion_text = st.text_area(
-        "Exclusion Criteria, one per line",
+        "Exclusion Criteria",
         key="citation_exclusion_criteria",
         height=120,
-        placeholder="Example: Not an empirical study\nExample: Not about the target population",
+        placeholder="1. Editorials, protocols, or reviews\n2. Not about the target population\n3. Published outside the eligible date range",
+        help="Optional. Use numbered criteria for long items. Wrapped lines are treated as part of the previous numbered criterion.",
     )
-    exclusion_criteria = split_lines(exclusion_text)
+    inclusion_criteria = parse_criteria_text(inclusion_text)
+    exclusion_criteria = parse_criteria_text(exclusion_text)
+
+    preview_col_1, preview_col_2 = st.columns(2)
+    with preview_col_1:
+        render_criteria_preview("inclusion criteria", inclusion_criteria)
+    with preview_col_2:
+        render_criteria_preview("exclusion criteria", exclusion_criteria)
 
     render_citation_metrics()
 
@@ -2723,72 +3016,122 @@ def render_citation_screening(
     with screen_col_1:
         run_deduplication = st.button("Deduplicate", help="Import RIS/NBIB records and remove duplicates.")
     with screen_col_2:
-        run_ai_marking = st.button("AI mark", help="Mark clearly irrelevant records after deduplication.")
+        run_ai_marking = st.button(
+            "AI mark",
+            help="Import the currently uploaded RIS/NBIB records and mark them without deduplication. If no file is uploaded, mark the current screening set.",
+        )
     with screen_col_3:
-        run_full_screening = st.button("Deduplicate + AI mark", help="Run deduplication and AI exclusion marking in one step.")
+        run_full_screening = st.button("Deduplicate + AI mark", help="Run deduplication and AI inclusion marking in one step.")
     with screen_col_4:
         if st.button("Clear", help="Clear citation screening results."):
-            st.session_state.citation_records = []
-            st.session_state.citation_duplicate_log = []
-            st.session_state.citation_import_log = []
-            st.session_state.citation_errors = []
-            st.session_state.citation_ai_prompt_used = ""
-            st.session_state.citation_imported_count = 0
-            st.session_state.citation_export_timestamp = ""
+            clear_citation_state()
             st.rerun()
 
     if run_deduplication:
         if not citation_files:
             st.warning("Please upload at least one RIS or NBIB file.")
         else:
+            status = st.empty()
+            status.info("Deduplicating citations...")
             records, errors, import_log = parse_citation_uploads(citation_files)
-            deduplicated_records, duplicate_log = deduplicate_citations(records)
-            st.session_state.citation_records = deduplicated_records
-            st.session_state.citation_duplicate_log = duplicate_log
-            st.session_state.citation_import_log = import_log
-            st.session_state.citation_errors = errors
-            st.session_state.citation_ai_prompt_used = ""
-            st.session_state.citation_imported_count = len(records)
-            st.session_state.citation_export_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-            st.success("Deduplication finished.")
-            st.rerun()
+            if not records:
+                st.session_state.citation_records = []
+                st.session_state.citation_duplicate_log = []
+                st.session_state.citation_import_log = import_log
+                st.session_state.citation_errors = errors
+                st.session_state.citation_ai_prompt_used = ""
+                st.session_state.citation_imported_count = 0
+                st.session_state.citation_export_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+                save_citation_state()
+                status.warning("No valid citation records were found in the uploaded files.")
+            else:
+                deduplicated_records, duplicate_log = deduplicate_citations(records)
+                st.session_state.citation_records = deduplicated_records
+                st.session_state.citation_duplicate_log = duplicate_log
+                st.session_state.citation_import_log = import_log
+                st.session_state.citation_errors = errors
+                st.session_state.citation_ai_prompt_used = ""
+                st.session_state.citation_imported_count = len(records)
+                st.session_state.citation_export_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+                save_citation_state()
+                status.success(
+                    "Deduplication finished. "
+                    f"Imported {len(records)} records, removed {len(duplicate_log)} duplicates, "
+                    f"{len(deduplicated_records)} records remain."
+                )
 
     if run_ai_marking:
-        if not st.session_state.citation_records:
-            st.warning("Please run deduplication before AI exclusion marking.")
-        elif not exclusion_criteria:
-            st.warning("Please enter at least one Exclusion Criterion.")
+        if not inclusion_criteria:
+            st.warning("Please enter at least one Inclusion Criterion.")
         elif not api_key:
-            st.warning("Please enter an API key before running AI exclusion marking.")
+            st.warning("Please enter an API key before running AI inclusion marking.")
         else:
+            if citation_files:
+                records, errors, import_log = parse_citation_uploads(citation_files)
+                if not records:
+                    st.session_state.citation_records = []
+                    st.session_state.citation_duplicate_log = []
+                    st.session_state.citation_import_log = import_log
+                    st.session_state.citation_errors = errors
+                    st.session_state.citation_imported_count = 0
+                    save_citation_state()
+                    st.warning("No valid citation records were found in the uploaded files.")
+                    return
+                st.session_state.citation_records = records
+                st.session_state.citation_duplicate_log = []
+                st.session_state.citation_import_log = import_log
+                st.session_state.citation_errors = errors
+                st.session_state.citation_imported_count = len(records)
+                st.session_state.citation_ai_prompt_used = ""
+            elif not st.session_state.citation_records:
+                if not citation_files:
+                    st.warning("Please upload at least one RIS or NBIB file, or run deduplication first.")
+                    return
             status = st.empty()
             progress = st.progress(0)
+            run_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+            st.session_state.citation_export_timestamp = run_timestamp
+            st.session_state.citation_ai_prompt_used = citation_inclusion_prompt_note(
+                inclusion_prompt_template,
+                inclusion_criteria,
+                exclusion_criteria,
+                len(st.session_state.citation_records),
+            )
+            save_citation_state()
             try:
-                marked_records, prompt_used = mark_citation_exclusions_batched(
+                marked_records, prompt_used = mark_citation_inclusions_batched(
                     records=st.session_state.citation_records,
+                    inclusion_criteria=inclusion_criteria,
                     exclusion_criteria=exclusion_criteria,
                     api_key=api_key,
                     base_url=base_url,
                     model=model,
-                    prompt_template=exclusion_prompt_template,
+                    prompt_template=inclusion_prompt_template,
                     status=status,
                     progress=progress,
+                    checkpoint=lambda checkpoint_records: persist_citation_records(
+                        checkpoint_records,
+                        export_timestamp=run_timestamp,
+                    ),
                 )
-                st.session_state.citation_records = marked_records
-                st.session_state.citation_ai_prompt_used = prompt_used
-                st.session_state.citation_export_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-                status.success("AI exclusion marking finished.")
+                persist_citation_records(
+                    marked_records,
+                    ai_prompt_used=prompt_used,
+                    export_timestamp=run_timestamp,
+                )
+                status.success("AI inclusion marking finished.")
                 st.rerun()
             except Exception as exc:
-                status.error(f"AI exclusion marking failed: {exc}")
+                save_citation_state()
+                status.error(f"AI inclusion marking failed: {exc}")
 
     if run_full_screening:
         if not citation_files:
             st.warning("Please upload at least one RIS or NBIB file.")
-        elif not exclusion_criteria:
-            st.warning("Please enter at least one Exclusion Criterion.")
+        elif not inclusion_criteria:
+            st.warning("Please enter at least one Inclusion Criterion.")
         elif not api_key:
-            st.warning("Please enter an API key before running AI exclusion marking.")
+            st.warning("Please enter an API key before running AI inclusion marking.")
         else:
             status = st.empty()
             status.info("Deduplicating citations...")
@@ -2798,73 +3141,110 @@ def render_citation_screening(
             st.session_state.citation_duplicate_log = duplicate_log
             st.session_state.citation_import_log = import_log
             st.session_state.citation_errors = errors
+            run_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+            persist_citation_records(
+                deduplicated_records,
+                ai_prompt_used=citation_inclusion_prompt_note(
+                    inclusion_prompt_template,
+                    inclusion_criteria,
+                    exclusion_criteria,
+                    len(deduplicated_records),
+                ),
+                export_timestamp=run_timestamp,
+            )
             try:
                 progress = st.progress(0)
-                marked_records, prompt_used = mark_citation_exclusions_batched(
+                marked_records, prompt_used = mark_citation_inclusions_batched(
                     records=deduplicated_records,
+                    inclusion_criteria=inclusion_criteria,
                     exclusion_criteria=exclusion_criteria,
                     api_key=api_key,
                     base_url=base_url,
                     model=model,
-                    prompt_template=exclusion_prompt_template,
+                    prompt_template=inclusion_prompt_template,
                     status=status,
                     progress=progress,
+                    checkpoint=lambda checkpoint_records: persist_citation_records(
+                        checkpoint_records,
+                        export_timestamp=run_timestamp,
+                    ),
                 )
-                st.session_state.citation_records = marked_records
-                st.session_state.citation_ai_prompt_used = prompt_used
-                st.session_state.citation_export_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-                status.success("Deduplication and AI exclusion marking finished.")
+                persist_citation_records(
+                    marked_records,
+                    ai_prompt_used=prompt_used,
+                    export_timestamp=run_timestamp,
+                )
+                status.success("Deduplication and AI inclusion marking finished.")
                 st.rerun()
             except Exception as exc:
-                st.session_state.citation_records = deduplicated_records
-                st.session_state.citation_ai_prompt_used = ""
-                st.session_state.citation_export_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-                status.error(f"Deduplication finished, but AI exclusion marking failed: {exc}")
+                save_citation_state()
+                status.error(f"Deduplication finished, but AI inclusion marking failed: {exc}")
 
     if st.session_state.citation_records:
         st.markdown("**Screening results**")
         screening_df = pd.DataFrame(
-            [citation_to_screening_row(record) for record in st.session_state.citation_records]
+            [
+                citation_to_screening_row(
+                    record,
+                    inclusion_criteria_count=len(inclusion_criteria),
+                    exclusion_criteria_count=len(exclusion_criteria),
+                )
+                for record in st.session_state.citation_records
+            ]
         )
         st.dataframe(screening_df, width="stretch")
 
         timestamp = st.session_state.citation_export_timestamp or datetime.now().strftime("%Y%m%d_%H%M")
-        excel_bytes = build_screening_excel_export(
-            records=st.session_state.citation_records,
-            duplicate_log=st.session_state.citation_duplicate_log,
-            import_log=st.session_state.citation_import_log,
-            exclusion_criteria=exclusion_criteria,
-            ai_prompt_used=st.session_state.citation_ai_prompt_used,
-        )
+        excel_bytes = None
+        try:
+            excel_bytes = build_screening_excel_export(
+                records=st.session_state.citation_records,
+                duplicate_log=st.session_state.citation_duplicate_log,
+                import_log=st.session_state.citation_import_log,
+                inclusion_criteria=inclusion_criteria,
+                exclusion_criteria=exclusion_criteria,
+                ai_prompt_used=st.session_state.citation_ai_prompt_used,
+            )
+        except Exception as exc:
+            st.error(f"Excel audit file could not be generated: {exc}")
         relevant_records = [
             record
             for record in st.session_state.citation_records
-            if not record.get("ai_suggested_exclusion")
+            if citation_suggests_inclusion(record)
         ]
-        all_deduplicated_ris = build_ris_export(st.session_state.citation_records)
+        all_screening_ris = build_ris_export(st.session_state.citation_records)
         relevant_ris = build_ris_export(relevant_records)
+        backup_json = json.dumps(citation_state_payload(), ensure_ascii=False, indent=2).encode("utf-8")
 
-        export_col_1, export_col_2, export_col_3 = st.columns(3)
+        export_col_1, export_col_2, export_col_3, export_col_4 = st.columns(4)
         with export_col_1:
-            st.download_button(
-                "Download Excel audit file",
-                data=excel_bytes,
-                file_name=f"citation_screening_audit_{timestamp}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            if excel_bytes is not None:
+                st.download_button(
+                    "Download Excel audit file",
+                    data=excel_bytes,
+                    file_name=f"citation_screening_audit_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
         with export_col_2:
             st.download_button(
-                "Download RIS: deduplicated + AI relevant only",
+                "Download RIS: AI suggested inclusion only",
                 data=relevant_ris,
-                file_name=f"deduplicated_ai_relevant_records_{timestamp}.ris",
+                file_name=f"ai_suggested_inclusion_records_{timestamp}.ris",
                 mime="application/x-research-info-systems",
             )
         with export_col_3:
             st.download_button(
-                "Download RIS: deduplicated only",
-                data=all_deduplicated_ris,
-                file_name=f"deduplicated_all_records_{timestamp}.ris",
+                "Download RIS: all screening records",
+                data=all_screening_ris,
+                file_name=f"all_screening_records_{timestamp}.ris",
                 mime="application/x-research-info-systems",
+            )
+        with export_col_4:
+            st.download_button(
+                "Download JSON backup",
+                data=backup_json,
+                file_name=f"citation_screening_backup_{timestamp}.json",
+                mime="application/json",
             )
 
     if st.session_state.citation_duplicate_log:
@@ -2890,13 +3270,13 @@ def main() -> None:
         st.markdown('<div class="sidebar-brand">AQEReview</div>', unsafe_allow_html=True)
         api_key, base_url, model = render_settings()
         st.divider()
-        citation_exclusion_prompt_template, prompt_template, mmat_prompt_template = render_prompt_settings()
+        citation_inclusion_prompt_template, prompt_template, mmat_prompt_template = render_prompt_settings()
         st.divider()
         fields, questions = render_template()
 
     render_header()
 
-    render_citation_screening(api_key, base_url, model, citation_exclusion_prompt_template)
+    render_citation_screening(api_key, base_url, model, citation_inclusion_prompt_template)
     st.divider()
 
     render_upload_intro()
