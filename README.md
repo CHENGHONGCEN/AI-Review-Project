@@ -12,6 +12,7 @@ The app is designed for personal research use:
 - Mark citation records against user-provided inclusion criteria before full-text extraction.
 - Export citation screening results as an Excel audit file and two standard RIS files.
 - Extract research-question evidence with an exhaustive strategy rather than a fixed excerpt limit.
+- Export highlighted copies of processed PDFs, with different research questions marked in different colors.
 - Run MMAT 2018 quality assessment as a separate step or together with extraction.
 - View, edit, and restore separate AI prompt templates for extraction and MMAT appraisal.
 - Use a protected MMAT 2018 rubric inserted by the app, with the official manual available for download inside the interface.
@@ -51,6 +52,7 @@ You can change the base URL later if you use another OpenAI-compatible provider.
 - MMAT response cells marked `No` or `Can't tell` are highlighted for review.
 - If the extraction fields and research questions stay the same, the summary sheet keeps the same column structure.
 - The Excel export includes extraction sheets, MMAT quality assessment sheets, and a `Methodology Prompt` sheet with the actual prompts used.
+- The highlighted PDF export creates a zip file with marked PDFs, a color legend, and a match report for excerpts that could not be located in the PDF text layer.
 - Citation screening exports use timestamped file names in `YYYYMMDD_HHMM` format.
 - Duplicate citation records are removed from the main screening result, but kept in the Excel duplicate log for traceability.
 - AI inclusion marking is conservative and only flags records; it does not delete records from the screening Excel.
