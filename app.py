@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import os
 import re
 import unicodedata
 from datetime import datetime
@@ -33,6 +34,12 @@ CITATION_AI_BATCH_DELAY_SECONDS = 3
 APP_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = APP_DIR / "assets"
 CITATION_AUTOSAVE_PATH = APP_DIR / "citation_screening_autosave.json"
+CITATION_AUTOSAVE_ENABLED = os.getenv("AQEREVIEW_ENABLE_LOCAL_CITATION_AUTOSAVE", "").strip().casefold() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 MMAT_MANUAL_VERSION = "MMAT 2018 criteria manual, 2018-08-01"
 MMAT_MANUAL_FILENAME = "MMAT__criteria-manual_2018-08-01_ENG.pdf"
 MMAT_MANUAL_PATH = ASSETS_DIR / MMAT_MANUAL_FILENAME
@@ -1675,6 +1682,8 @@ def citation_to_screening_row(
 
 def citation_state_payload() -> dict[str, Any]:
     return {
+        "backup_type": "citation_screening_state",
+        "schema_version": 1,
         "citation_records": st.session_state.get("citation_records", []),
         "citation_duplicate_log": st.session_state.get("citation_duplicate_log", []),
         "citation_import_log": st.session_state.get("citation_import_log", []),
@@ -1682,11 +1691,13 @@ def citation_state_payload() -> dict[str, Any]:
         "citation_ai_prompt_used": st.session_state.get("citation_ai_prompt_used", ""),
         "citation_imported_count": int(st.session_state.get("citation_imported_count", 0)),
         "citation_export_timestamp": st.session_state.get("citation_export_timestamp", ""),
+        "citation_inclusion_criteria_text": st.session_state.get("citation_inclusion_criteria", ""),
+        "citation_exclusion_criteria_text": st.session_state.get("citation_exclusion_criteria", ""),
         "saved_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 
-def apply_citation_state(payload: dict[str, Any]) -> None:
+def apply_citation_state(payload: dict[str, Any], restore_criteria: bool = False) -> None:
     st.session_state.citation_records = payload.get("citation_records", [])
     st.session_state.citation_duplicate_log = payload.get("citation_duplicate_log", [])
     st.session_state.citation_import_log = payload.get("citation_import_log", [])
@@ -1694,9 +1705,41 @@ def apply_citation_state(payload: dict[str, Any]) -> None:
     st.session_state.citation_ai_prompt_used = payload.get("citation_ai_prompt_used", "")
     st.session_state.citation_imported_count = int(payload.get("citation_imported_count", 0) or 0)
     st.session_state.citation_export_timestamp = payload.get("citation_export_timestamp", "")
+    if restore_criteria:
+        if "citation_inclusion_criteria_text" in payload:
+            st.session_state.citation_inclusion_criteria = payload.get("citation_inclusion_criteria_text", "")
+        if "citation_exclusion_criteria_text" in payload:
+            st.session_state.citation_exclusion_criteria = payload.get("citation_exclusion_criteria_text", "")
+
+
+def parse_citation_backup_upload(uploaded_backup: Any) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        payload = json.loads(uploaded_backup.getvalue().decode("utf-8-sig"))
+    except UnicodeDecodeError:
+        return None, "The JSON backup could not be read as UTF-8 text."
+    except json.JSONDecodeError as exc:
+        return None, f"The uploaded file is not valid JSON: {exc}"
+
+    if not isinstance(payload, dict):
+        return None, "The uploaded JSON backup must contain one object."
+    if not isinstance(payload.get("citation_records"), list):
+        return None, "The uploaded JSON backup does not contain citation screening records."
+
+    list_fields = [
+        "citation_duplicate_log",
+        "citation_import_log",
+        "citation_errors",
+    ]
+    for field in list_fields:
+        if field in payload and not isinstance(payload[field], list):
+            return None, f"The uploaded JSON backup has an invalid {field} field."
+
+    return payload, None
 
 
 def save_citation_state() -> None:
+    if not CITATION_AUTOSAVE_ENABLED:
+        return
     temp_path = CITATION_AUTOSAVE_PATH.with_suffix(".tmp")
     temp_path.write_text(
         json.dumps(citation_state_payload(), ensure_ascii=False),
@@ -1706,6 +1749,8 @@ def save_citation_state() -> None:
 
 
 def load_citation_state() -> dict[str, Any] | None:
+    if not CITATION_AUTOSAVE_ENABLED:
+        return None
     if not CITATION_AUTOSAVE_PATH.exists():
         return None
     try:
@@ -3023,6 +3068,10 @@ def render_citation_screening(
         '<div class="section-note">Upload RIS or PubMed NBIB files, optionally remove duplicates, and mark records against your inclusion and exclusion criteria before full-text extraction.</div>',
         unsafe_allow_html=True,
     )
+    restore_notice = st.session_state.pop("citation_restore_notice", "")
+    if restore_notice:
+        st.success(restore_notice)
+
     citation_files = st.file_uploader(
         "Upload RIS or NBIB citation files",
         type=["ris", "nbib"],
@@ -3030,6 +3079,35 @@ def render_citation_screening(
         key="citation_file_uploader",
         help="You can upload files from multiple databases. PubMed Citation Manager .nbib files are supported.",
     )
+
+    with st.expander("Restore screening from JSON backup", expanded=False):
+        st.caption(
+            "Use a JSON backup downloaded from this app to restore citation screening results. "
+            "This is the reliable recovery method for shared Streamlit Cloud deployments."
+        )
+        uploaded_backup = st.file_uploader(
+            "Upload citation screening JSON backup",
+            type=["json"],
+            key="citation_backup_restore_uploader",
+            help="Upload a citation_screening_backup_*.json file previously downloaded from this app.",
+        )
+        if st.button("Restore JSON backup", disabled=uploaded_backup is None):
+            payload, error = parse_citation_backup_upload(uploaded_backup)
+            if error:
+                st.error(error)
+            else:
+                apply_citation_state(payload, restore_criteria=True)
+                save_citation_state()
+                restored_count = len(payload.get("citation_records", []) or [])
+                st.session_state.citation_restore_notice = (
+                    f"Restored {restored_count} citation screening records from the uploaded JSON backup."
+                )
+                st.rerun()
+        st.caption(
+            "Server-side autosave is disabled by default because one shared Cloud deployment can be used by multiple people. "
+            "Download a JSON backup after each important screening run."
+        )
+
     inclusion_text = st.text_area(
         "Inclusion Criteria",
         key="citation_inclusion_criteria",

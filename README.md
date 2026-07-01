@@ -10,7 +10,7 @@ The app is designed for personal research use:
 - Export results as an Excel `.xlsx` workbook.
 - Upload RIS and PubMed NBIB citation files for pre-screening deduplication.
 - Mark citation records against user-provided inclusion criteria before full-text extraction.
-- Export citation screening results as an Excel audit file and two standard RIS files.
+- Export citation screening results as an Excel audit file, two standard RIS files, and a JSON backup that can be uploaded later to restore results.
 - Extract research-question evidence with an exhaustive strategy rather than a fixed excerpt limit.
 - Export highlighted copies of processed PDFs, with different research questions marked in different colors.
 - Run MMAT 2018 quality assessment as a separate step or together with extraction.
@@ -75,6 +75,9 @@ The export buttons create:
 - `citation_screening_audit_YYYYMMDD_HHMM.xlsx`: screening results, duplicate log, and methodology details.
 - `ai_suggested_inclusion_records_YYYYMMDD_HHMM.ris`: records marked as matching or potentially matching the inclusion criteria.
 - `all_screening_records_YYYYMMDD_HHMM.ris`: all current screening records.
+- `citation_screening_backup_YYYYMMDD_HHMM.json`: a restorable backup for the citation screening state.
+
+For shared Streamlit Cloud deployments, use the JSON backup download and restore controls as the reliable recovery path. Server-side citation autosave is disabled by default so that multiple users do not recover or overwrite each other's screening state. To enable local-only autosave while running the app on your own computer, set `AQEREVIEW_ENABLE_LOCAL_CITATION_AUTOSAVE=1` before starting Streamlit.
 
 Use `AI mark` when you want to mark the current uploaded records without deduplication first. Use `Deduplicate + AI mark` when you want the app to perform citation deduplication and AI inclusion marking in one step.
 
