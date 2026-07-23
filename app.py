@@ -8,7 +8,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from html import escape, unescape
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 from typing import Any
 
 import pandas as pd
@@ -25,7 +25,8 @@ import pdf_highlighting
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-5.5"
-CONFIDENCE_LEVELS = ["high", "medium", "low"]
+APP_VERSION = "0.13.0"
+APP_LAST_UPDATED = "2026-07-23"
 SIMILARITY_THRESHOLD = 0.95
 CITATION_ABSTRACT_TOKEN_OVERLAP_THRESHOLD = 0.95
 CITATION_AI_MAX_BATCH_RECORDS = 8
@@ -71,9 +72,8 @@ Anti-hallucination rules:
 - Do not use outside knowledge, assumptions about the topic, or common patterns from similar papers.
 - Do not make up page numbers, sections, participant characteristics, methods, outcomes, or conclusions.
 - Do not treat the abstract alone as enough if the full text contains more specific evidence.
-- If a requested field is ambiguous, choose the most conservative answer and mark confidence as "low".
-- If evidence is indirect, partial, or only implied, say so in low_confidence_reason.
-- If the PDF text is unreadable, incomplete, scanned poorly, or appears to omit pages, mark confidence as "low" and add a review warning.
+- If a requested field is ambiguous, choose the most conservative answer and state the uncertainty directly in the value or summary.
+- If the PDF text is unreadable, incomplete, scanned poorly, or appears to omit pages, state that limitation directly in the affected value or summary.
 
 Anti-miss rules:
 - Use an exhaustive extraction strategy for research-question evidence.
@@ -89,16 +89,10 @@ Source-location rules:
 - If page numbers are not visible, use section names such as "Abstract", "Results", "Discussion", "Table 2", or "Figure 1".
 - If neither page nor section is clear, write "location unclear".
 
-Confidence rules:
-- Use "high" only when the answer is directly supported by clear article text.
-- Use "medium" when the answer is supported but incomplete, scattered, or requires minor interpretation.
-- Use "low" when the answer is uncertain, indirect, missing, contradictory, or affected by PDF quality.
-- Use low_confidence_reason to explain every medium or low confidence answer in plain language.
-
 Output content rules:
 - Return one article record only.
-- For every requested structured field, provide a value, source_location, confidence, and low_confidence_reason.
-- For every requested research question, provide an answer_summary, confidence, low_confidence_reason, and all relevant excerpts.
+- For every requested structured field, provide a value and source_location.
+- For every requested research question, provide an answer_summary and all relevant excerpts.
 - Never leave required values blank. Use "Not found" or "Not relevant to this article" where appropriate.
 - Follow the required structured output schema exactly.
 
@@ -260,7 +254,6 @@ Core rules:
 - If the PDF does not report enough information to answer a criterion, use "Can't tell".
 - Give a short plain-language justification and evidence location for every answer.
 - Include page numbers when visible or inferable. If not, use section names such as "Abstract", "Methods", "Results", "Table 1", or "location unclear".
-- Mark confidence as "low" when the answer depends on unclear reporting, missing text, poor PDF quality, or difficult study design classification.
 """.strip()
 
 DEFAULT_INCLUSION_PROMPT_TEMPLATE = """
@@ -311,16 +304,12 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                 "authors": {"type": "string"},
                 "year": {"type": "string"},
                 "journal": {"type": "string"},
-                "overall_confidence": {"type": "string", "enum": CONFIDENCE_LEVELS},
-                "low_confidence_reason": {"type": "string"},
             },
             "required": [
                 "title",
                 "authors",
                 "year",
                 "journal",
-                "overall_confidence",
-                "low_confidence_reason",
             ],
         },
         "structured_fields": {
@@ -332,15 +321,11 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                     "name": {"type": "string"},
                     "value": {"type": "string"},
                     "source_location": {"type": "string"},
-                    "confidence": {"type": "string", "enum": CONFIDENCE_LEVELS},
-                    "low_confidence_reason": {"type": "string"},
                 },
                 "required": [
                     "name",
                     "value",
                     "source_location",
-                    "confidence",
-                    "low_confidence_reason",
                 ],
             },
         },
@@ -352,8 +337,6 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "question": {"type": "string"},
                     "answer_summary": {"type": "string"},
-                    "confidence": {"type": "string", "enum": CONFIDENCE_LEVELS},
-                    "low_confidence_reason": {"type": "string"},
                     "excerpts": {
                         "type": "array",
                         "items": {
@@ -371,22 +354,15 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                 "required": [
                     "question",
                     "answer_summary",
-                    "confidence",
-                    "low_confidence_reason",
                     "excerpts",
                 ],
             },
-        },
-        "review_warnings": {
-            "type": "array",
-            "items": {"type": "string"},
         },
     },
     "required": [
         "article",
         "structured_fields",
         "research_question_evidence",
-        "review_warnings",
     ],
 }
 
@@ -400,8 +376,6 @@ MMAT_QUESTION_SCHEMA: dict[str, Any] = {
         "response": {"type": "string", "enum": MMAT_RESPONSES},
         "justification": {"type": "string"},
         "source_location": {"type": "string"},
-        "confidence": {"type": "string", "enum": CONFIDENCE_LEVELS},
-        "low_confidence_reason": {"type": "string"},
     },
     "required": [
         "criterion_id",
@@ -409,8 +383,6 @@ MMAT_QUESTION_SCHEMA: dict[str, Any] = {
         "response",
         "justification",
         "source_location",
-        "confidence",
-        "low_confidence_reason",
     ],
 }
 
@@ -458,17 +430,12 @@ MMAT_SCHEMA: dict[str, Any] = {
             "maxItems": 5,
             "items": MMAT_QUESTION_SCHEMA,
         },
-        "review_warnings": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
     },
     "required": [
         "article",
         "study_design",
         "screening_questions",
         "category_criteria",
-        "review_warnings",
     ],
 }
 
@@ -1131,12 +1098,14 @@ def mark_citation_inclusions_batched(
     batches = batch_citations_for_ai(records)
     marked_records: list[dict[str, Any]] = []
     total_batches = len(batches)
+    started_at = monotonic()
 
     for batch_index, batch in enumerate(batches, start=1):
         if status is not None:
             status.info(
                 f"AI marking citation batch {batch_index}/{total_batches} "
-                f"({len(batch)} records)"
+                f"({len(batch)} records). "
+                f"{estimated_time_text(started_at, batch_index - 1, total_batches)}"
             )
         marked_batch, _prompt_used = mark_citation_inclusions(
             records=batch,
@@ -1157,6 +1126,11 @@ def mark_citation_inclusions_batched(
             checkpoint(marked_records + remaining_records)
         if progress is not None:
             progress.progress(batch_index / total_batches)
+        if status is not None and batch_index < total_batches:
+            status.info(
+                f"Completed citation batch {batch_index}/{total_batches}. "
+                f"{estimated_time_text(started_at, batch_index, total_batches)}"
+            )
         if batch_index < total_batches and CITATION_AI_BATCH_DELAY_SECONDS > 0:
             sleep(CITATION_AI_BATCH_DELAY_SECONDS)
 
@@ -1320,17 +1294,50 @@ def clean_text(value: Any, default: str = "Not found") -> str:
     return text if text else default
 
 
+def remove_deprecated_output_instructions(prompt: str) -> str:
+    deprecated_terms = (
+        "confidence",
+        "low_confidence_reason",
+        "review warning",
+        "review_warnings",
+    )
+    kept_lines = [
+        line
+        for line in str(prompt).splitlines()
+        if not any(term in line.casefold() for term in deprecated_terms)
+    ]
+    return "\n".join(kept_lines).strip()
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds_part = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds_part}s"
+    return f"{seconds_part}s"
+
+
+def estimated_time_text(started_at: float, completed: int, total: int) -> str:
+    if completed <= 0:
+        return "Estimated time will appear after the first item finishes."
+    elapsed = monotonic() - started_at
+    average_seconds = elapsed / completed
+    remaining_seconds = average_seconds * max(total - completed, 0)
+    return (
+        f"Estimated remaining: {format_duration(remaining_seconds)} "
+        f"(average {format_duration(average_seconds)} per item)."
+    )
+
+
 def clean_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
         return value.strip().casefold() in {"true", "yes", "1"}
     return default
-
-
-def clean_confidence(value: Any) -> str:
-    confidence = clean_text(value, "low").lower()
-    return confidence if confidence in CONFIDENCE_LEVELS else "low"
 
 
 def clean_mmat_response(value: Any) -> str:
@@ -1345,8 +1352,6 @@ def normalize_mmat_question(item: dict[str, Any], criterion_id: str, criterion: 
         "response": clean_mmat_response(item.get("response")),
         "justification": clean_text(item.get("justification")),
         "source_location": clean_text(item.get("source_location")),
-        "confidence": clean_confidence(item.get("confidence")),
-        "low_confidence_reason": clean_text(item.get("low_confidence_reason"), ""),
     }
 
 
@@ -1401,18 +1406,7 @@ def normalize_mmat_result(data: dict[str, Any]) -> dict[str, Any]:
         normalized_criteria.append(normalize_mmat_question(item, criterion_id, criterion))
     data["category_criteria"] = normalized_criteria
 
-    warnings = [
-        clean_text(warning, "")
-        for warning in data.get("review_warnings", [])
-        if clean_text(warning, "")
-    ]
-    if any(item["response"] != "Yes" for item in normalized_screening):
-        warnings.append(
-            "One or both MMAT screening questions were not answered Yes; further appraisal may not be feasible or appropriate."
-        )
-    if not study_design["suitable_for_mmat"]:
-        warnings.append("This paper was marked as not suitable for MMAT appraisal.")
-    data["review_warnings"] = list(dict.fromkeys(warnings))
+    data.pop("review_warnings", None)
     return data
 
 
@@ -1424,10 +1418,8 @@ def normalize_extraction_result(
     article = data.setdefault("article", {})
     for key in ("title", "authors", "year", "journal"):
         article[key] = clean_text(article.get(key))
-    article["overall_confidence"] = clean_text(article.get("overall_confidence"), "low").lower()
-    if article["overall_confidence"] not in CONFIDENCE_LEVELS:
-        article["overall_confidence"] = "low"
-    article["low_confidence_reason"] = clean_text(article.get("low_confidence_reason"))
+    article.pop("overall_confidence", None)
+    article.pop("low_confidence_reason", None)
 
     returned_fields = {
         clean_text(item.get("name"), "").casefold(): item
@@ -1437,14 +1429,11 @@ def normalize_extraction_result(
     normalized_fields = []
     for field in fields:
         item = returned_fields.get(field.casefold(), {})
-        confidence = clean_text(item.get("confidence"), "low").lower()
         normalized_fields.append(
             {
                 "name": field,
                 "value": clean_text(item.get("value")),
                 "source_location": clean_text(item.get("source_location")),
-                "confidence": confidence if confidence in CONFIDENCE_LEVELS else "low",
-                "low_confidence_reason": clean_text(item.get("low_confidence_reason")),
             }
         )
     data["structured_fields"] = normalized_fields
@@ -1455,7 +1444,6 @@ def normalize_extraction_result(
     normalized_evidence = []
     for index, question in enumerate(questions, start=1):
         item = returned_evidence[index - 1] if index - 1 < len(returned_evidence) else {}
-        confidence = clean_text(item.get("confidence"), "low").lower()
         excerpts = []
         for excerpt in item.get("excerpts", []) or []:
             if not isinstance(excerpt, dict):
@@ -1471,15 +1459,11 @@ def normalize_extraction_result(
             {
                 "question": f"RQ{index}: {question}",
                 "answer_summary": clean_text(item.get("answer_summary")),
-                "confidence": confidence if confidence in CONFIDENCE_LEVELS else "low",
-                "low_confidence_reason": clean_text(item.get("low_confidence_reason")),
                 "excerpts": excerpts,
             }
         )
     data["research_question_evidence"] = normalized_evidence
-    data["review_warnings"] = [
-        clean_text(warning, "") for warning in data.get("review_warnings", []) if clean_text(warning, "")
-    ]
+    data.pop("review_warnings", None)
     return data
 
 
@@ -1509,8 +1493,6 @@ def result_to_flat_row(result: dict[str, Any]) -> dict[str, str]:
         "authors": article.get("authors", ""),
         "year": article.get("year", ""),
         "journal": article.get("journal", ""),
-        "overall_confidence": article.get("overall_confidence", ""),
-        "review_warnings": "; ".join(result.get("review_warnings", [])),
     }
 
     fields_by_name = {
@@ -1519,19 +1501,13 @@ def result_to_flat_row(result: dict[str, Any]) -> dict[str, str]:
     for field in requested_fields_for_result(result):
         item = fields_by_name.get(field.casefold(), {})
         row[field] = clean_text(item.get("value"))
-        row[f"{field} confidence"] = clean_text(item.get("confidence"), "low")
 
     evidence_items = result.get("research_question_evidence", [])
     for index, _question in enumerate(requested_questions_for_result(result), start=1):
         evidence = evidence_items[index - 1] if index - 1 < len(evidence_items) else {}
         row[f"RQ{index} summary"] = clean_text(evidence.get("answer_summary"))
-        row[f"RQ{index} confidence"] = clean_text(evidence.get("confidence"), "low")
 
     return row
-
-
-def confidence_needs_review(value: str) -> bool:
-    return value.lower() in {"low", "medium"}
 
 
 def mmat_response_needs_review(value: str) -> bool:
@@ -1540,9 +1516,7 @@ def mmat_response_needs_review(value: str) -> bool:
 
 def style_results(df: pd.DataFrame) -> Any:
     def highlight(value: Any) -> str:
-        if isinstance(value, str) and (
-            confidence_needs_review(value) or mmat_response_needs_review(value)
-        ):
+        if isinstance(value, str) and mmat_response_needs_review(value):
             return "background-color: #ffe5e5; color: #7a1f1f;"
         return ""
 
@@ -1561,7 +1535,6 @@ def result_to_evidence_rows(result: dict[str, Any]) -> list[dict[str, str]]:
                     "title": clean_text(article.get("title")),
                     "research question": f"RQ{question_index}",
                     "answer_summary": clean_text(evidence.get("answer_summary")),
-                    "confidence": clean_text(evidence.get("confidence"), "low"),
                     "excerpt": clean_text(excerpt.get("text")),
                     "source_location": clean_text(excerpt.get("source_location")),
                     "relevance_note": clean_text(excerpt.get("relevance_note")),
@@ -1583,18 +1556,15 @@ def mmat_result_to_summary_row(result: dict[str, Any]) -> dict[str, str]:
         "study_design_category": clean_text(study_design.get("category")),
         "classification_reason": clean_text(study_design.get("classification_reason")),
         "needs_human_review": str(study_design.get("needs_human_review", False)),
-        "review_warnings": "; ".join(result.get("review_warnings", [])),
     }
 
     for item in result.get("screening_questions", []):
         criterion_id = clean_text(item.get("criterion_id"), "S")
         row[f"{criterion_id} response"] = clean_text(item.get("response"), "Can't tell")
-        row[f"{criterion_id} confidence"] = clean_text(item.get("confidence"), "low")
 
     for item in result.get("category_criteria", []):
         criterion_id = clean_text(item.get("criterion_id"), "criterion")
         row[f"{criterion_id} response"] = clean_text(item.get("response"), "Can't tell")
-        row[f"{criterion_id} confidence"] = clean_text(item.get("confidence"), "low")
 
     return row
 
@@ -1619,8 +1589,6 @@ def mmat_result_to_evidence_rows(result: dict[str, Any]) -> list[dict[str, str]]
                     "response": clean_text(item.get("response"), "Can't tell"),
                     "justification": clean_text(item.get("justification")),
                     "source_location": clean_text(item.get("source_location")),
-                    "confidence": clean_text(item.get("confidence"), "low"),
-                    "low_confidence_reason": clean_text(item.get("low_confidence_reason"), ""),
                 }
             )
     return rows
@@ -1959,14 +1927,11 @@ def tune_excel_sheet(sheet: Any) -> None:
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             cell.border = border
-            is_confidence_cell = "confidence" in header_by_column.get(cell.column, "")
             is_response_cell = "response" in header_by_column.get(cell.column, "")
             if (
                 isinstance(cell.value, str)
-                and (
-                    (is_confidence_cell and confidence_needs_review(cell.value))
-                    or (is_response_cell and mmat_response_needs_review(cell.value))
-                )
+                and is_response_cell
+                and mmat_response_needs_review(cell.value)
             ):
                 cell.fill = review_fill
 
@@ -1993,7 +1958,7 @@ def merge_repeated_evidence_cells(sheet: Any) -> None:
     if sheet.max_row < 3:
         return
 
-    merge_columns = [1, 2, 3, 4, 5]
+    merge_columns = [1, 2, 3, 4]
     group_start = 2
     previous_key = None
 
@@ -2052,7 +2017,7 @@ def build_excel_export(
     if evidence_rows:
         add_rows_to_sheet(evidence_sheet, evidence_rows)
     else:
-        evidence_sheet.append(["File names", "title", "research question", "answer_summary", "confidence", "excerpt", "source_location", "relevance_note"])
+        evidence_sheet.append(["File names", "title", "research question", "answer_summary", "excerpt", "source_location", "relevance_note"])
     merge_repeated_evidence_cells(evidence_sheet)
     tune_excel_sheet(evidence_sheet)
 
@@ -2069,7 +2034,6 @@ def build_excel_export(
                 "study_design_category",
                 "S1 response",
                 "S2 response",
-                "review_warnings",
             ]
         )
     tune_excel_sheet(mmat_summary_sheet)
@@ -2092,8 +2056,6 @@ def build_excel_export(
                 "response",
                 "justification",
                 "source_location",
-                "confidence",
-                "low_confidence_reason",
             ]
         )
     tune_excel_sheet(mmat_evidence_sheet)
@@ -2142,6 +2104,16 @@ def initialise_state() -> None:
     st.session_state.setdefault("prompt_template", DEFAULT_PROMPT_TEMPLATE)
     st.session_state.setdefault("mmat_prompt_template", DEFAULT_MMAT_PROMPT_TEMPLATE)
     st.session_state.setdefault("uploaded_pdf_bytes", {})
+    for prompt_key in (
+        "prompt_template",
+        "prompt_template_text_area",
+        "mmat_prompt_template",
+        "mmat_prompt_text_area",
+    ):
+        if prompt_key in st.session_state:
+            st.session_state[prompt_key] = remove_deprecated_output_instructions(
+                st.session_state[prompt_key]
+            )
 
 
 def apply_custom_style() -> None:
@@ -2219,6 +2191,15 @@ def apply_custom_style() -> None:
             line-height: 1;
             margin: 0 0 -2.35rem;
             letter-spacing: 0;
+        }
+
+        .sidebar-release {
+            margin-top: 0.42rem;
+            color: var(--text-muted);
+            font-size: 0.72rem;
+            font-weight: 520;
+            letter-spacing: 0.01em;
+            line-height: 1.35;
         }
 
         [data-testid="stSidebar"] > div:first-child {
@@ -2620,6 +2601,11 @@ def render_workspace_panel(
 
 
 def render_upload_intro() -> None:
+    st.subheader("Evidence extraction & MMAT appraisal")
+    st.markdown(
+        '<div class="section-note">Upload full-text PDFs, extract evidence for your research questions, and run MMAT 2018 quality appraisal. PDFs are sent to the AI strictly one at a time.</div>',
+        unsafe_allow_html=True,
+    )
     st.markdown(
         f"""
         <div class="upload-shell">
@@ -2900,7 +2886,6 @@ def render_results() -> None:
             mmat_result_to_summary_row=mmat_result_to_summary_row,
             mmat_result_to_evidence_rows=mmat_result_to_evidence_rows,
             clean_cell_value=remove_excel_control_chars,
-            confidence_needs_review=confidence_needs_review,
             mmat_response_needs_review=mmat_response_needs_review,
             mmat_manual_version=MMAT_MANUAL_VERSION,
         )
@@ -2956,13 +2941,18 @@ def run_extraction_batch(
     progress: Any,
     progress_offset: int = 0,
     progress_total: int | None = None,
-) -> None:
+) -> float:
     st.session_state.results = []
     st.session_state.errors = []
     total = progress_total or len(uploaded_files)
+    started_at = monotonic()
+    file_total = len(uploaded_files)
 
     for index, uploaded_file in enumerate(uploaded_files, start=1):
-        status.info(f"Extracting {uploaded_file.name} ({index}/{len(uploaded_files)})")
+        status.info(
+            f"Sequential extraction: {uploaded_file.name} ({index}/{file_total}). "
+            f"{estimated_time_text(started_at, index - 1, file_total)}"
+        )
         try:
             result = extraction_service.extract_from_pdf(
                 uploaded_file=uploaded_file,
@@ -2982,6 +2972,12 @@ def run_extraction_batch(
                 {"file": uploaded_file.name, "message": str(exc)}
             )
         progress.progress((progress_offset + index) / total)
+        if index < file_total:
+            status.info(
+                f"Completed {index}/{file_total} PDFs. "
+                f"{estimated_time_text(started_at, index, file_total)}"
+            )
+    return monotonic() - started_at
 
 
 def run_mmat_batch(
@@ -2994,13 +2990,18 @@ def run_mmat_batch(
     progress: Any,
     progress_offset: int = 0,
     progress_total: int | None = None,
-) -> None:
+) -> float:
     st.session_state.qa_results = []
     st.session_state.qa_errors = []
     total = progress_total or len(uploaded_files)
+    started_at = monotonic()
+    file_total = len(uploaded_files)
 
     for index, uploaded_file in enumerate(uploaded_files, start=1):
-        status.info(f"Assessing MMAT quality for {uploaded_file.name} ({index}/{len(uploaded_files)})")
+        status.info(
+            f"Sequential MMAT appraisal: {uploaded_file.name} ({index}/{file_total}). "
+            f"{estimated_time_text(started_at, index - 1, file_total)}"
+        )
         try:
             result = extraction_service.assess_quality_from_pdf(
                 uploaded_file=uploaded_file,
@@ -3020,6 +3021,12 @@ def run_mmat_batch(
                 {"file": uploaded_file.name, "message": str(exc)}
             )
         progress.progress((progress_offset + index) / total)
+        if index < file_total:
+            status.info(
+                f"Completed {index}/{file_total} MMAT appraisals. "
+                f"{estimated_time_text(started_at, index, file_total)}"
+            )
+    return monotonic() - started_at
 
 
 def can_run_common(api_key: str, uploaded_files: list[Any] | None) -> bool:
@@ -3157,6 +3164,7 @@ def render_citation_screening(
         else:
             status = st.empty()
             status.info("Deduplicating citations...")
+            deduplication_started_at = monotonic()
             records, errors, import_log = parse_citation_uploads(citation_files)
             if not records:
                 st.session_state.citation_records = []
@@ -3167,7 +3175,10 @@ def render_citation_screening(
                 st.session_state.citation_imported_count = 0
                 st.session_state.citation_export_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
                 save_citation_state()
-                status.warning("No valid citation records were found in the uploaded files.")
+                status.warning(
+                    "No valid citation records were found in the uploaded files. "
+                    f"Finished in {format_duration(monotonic() - deduplication_started_at)}."
+                )
             else:
                 deduplicated_records, duplicate_log = deduplicate_citations(records)
                 st.session_state.citation_records = deduplicated_records
@@ -3181,7 +3192,8 @@ def render_citation_screening(
                 status.success(
                     "Deduplication finished. "
                     f"Imported {len(records)} records, removed {len(duplicate_log)} duplicates, "
-                    f"{len(deduplicated_records)} records remain."
+                    f"{len(deduplicated_records)} records remain. "
+                    f"Finished in {format_duration(monotonic() - deduplication_started_at)}."
                 )
 
     if run_ai_marking:
@@ -3223,6 +3235,7 @@ def render_citation_screening(
             )
             save_citation_state()
             try:
+                marking_started_at = monotonic()
                 marked_records, prompt_used = mark_citation_inclusions_batched(
                     records=st.session_state.citation_records,
                     inclusion_criteria=inclusion_criteria,
@@ -3243,7 +3256,10 @@ def render_citation_screening(
                     ai_prompt_used=prompt_used,
                     export_timestamp=run_timestamp,
                 )
-                status.success("AI inclusion marking finished.")
+                status.success(
+                    "AI inclusion marking finished in "
+                    f"{format_duration(monotonic() - marking_started_at)}."
+                )
                 st.rerun()
             except Exception as exc:
                 save_citation_state()
@@ -3259,6 +3275,7 @@ def render_citation_screening(
         else:
             status = st.empty()
             status.info("Deduplicating citations...")
+            full_screening_started_at = monotonic()
             records, errors, import_log = parse_citation_uploads(citation_files)
             deduplicated_records, duplicate_log = deduplicate_citations(records)
             st.session_state.citation_imported_count = len(records)
@@ -3298,7 +3315,10 @@ def render_citation_screening(
                     ai_prompt_used=prompt_used,
                     export_timestamp=run_timestamp,
                 )
-                status.success("Deduplication and AI inclusion marking finished.")
+                status.success(
+                    "Deduplication and AI inclusion marking finished in "
+                    f"{format_duration(monotonic() - full_screening_started_at)}."
+                )
                 st.rerun()
             except Exception as exc:
                 save_citation_state()
@@ -3386,12 +3406,20 @@ def render_citation_screening(
 
 
 def main() -> None:
-    st.set_page_config(page_title="AQEReview", layout="wide")
+    st.set_page_config(page_title=f"AQEReview v{APP_VERSION}", layout="wide")
     apply_custom_style()
     initialise_state()
 
     with st.sidebar:
-        st.markdown('<div class="sidebar-brand">AQEReview</div>', unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="sidebar-brand">
+                AQEReview
+                <div class="sidebar-release">v{APP_VERSION} · Updated {APP_LAST_UPDATED}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         api_key, base_url, model = render_settings()
         st.divider()
         citation_inclusion_prompt_template, prompt_template, mmat_prompt_template = render_prompt_settings()
@@ -3458,7 +3486,7 @@ def main() -> None:
             else:
                 progress = st.progress(0)
                 status = st.empty()
-                run_extraction_batch(
+                extraction_elapsed = run_extraction_batch(
                     uploaded_files=uploaded_files,
                     api_key=api_key,
                     base_url=base_url,
@@ -3469,13 +3497,15 @@ def main() -> None:
                     status=status,
                     progress=progress,
                 )
-                status.success("Extraction finished.")
+                status.success(
+                    f"Extraction finished in {format_duration(extraction_elapsed)}."
+                )
 
     if run_mmat:
         if can_run_common(api_key, uploaded_files):
             progress = st.progress(0)
             status = st.empty()
-            run_mmat_batch(
+            mmat_elapsed = run_mmat_batch(
                 uploaded_files=uploaded_files,
                 api_key=api_key,
                 base_url=base_url,
@@ -3484,7 +3514,10 @@ def main() -> None:
                 status=status,
                 progress=progress,
             )
-            status.success("MMAT quality assessment finished.")
+            status.success(
+                "MMAT quality assessment finished in "
+                f"{format_duration(mmat_elapsed)}."
+            )
 
     if run_full:
         if not can_run_common(api_key, uploaded_files):
@@ -3495,7 +3528,7 @@ def main() -> None:
             progress = st.progress(0)
             status = st.empty()
             total_steps = len(uploaded_files) * 2
-            run_extraction_batch(
+            extraction_elapsed = run_extraction_batch(
                 uploaded_files=uploaded_files,
                 api_key=api_key,
                 base_url=base_url,
@@ -3508,7 +3541,7 @@ def main() -> None:
                 progress_offset=0,
                 progress_total=total_steps,
             )
-            run_mmat_batch(
+            mmat_elapsed = run_mmat_batch(
                 uploaded_files=uploaded_files,
                 api_key=api_key,
                 base_url=base_url,
@@ -3519,7 +3552,10 @@ def main() -> None:
                 progress_offset=len(uploaded_files),
                 progress_total=total_steps,
             )
-            status.success("Full workflow finished.")
+            status.success(
+                "Full workflow finished in "
+                f"{format_duration(extraction_elapsed + mmat_elapsed)}."
+            )
 
     st.markdown('<div class="results-spacer"></div>', unsafe_allow_html=True)
     render_results()

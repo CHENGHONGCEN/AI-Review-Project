@@ -2,9 +2,13 @@
 
 This is a local Streamlit app for extracting systematic-review information from batches of research article PDFs.
 
+Current release: `v0.13.0` · Last updated: `2026-07-23`
+
 The app is designed for personal research use:
 
 - Upload multiple PDF files.
+- Process uploaded PDFs sequentially, with only one PDF sent to the AI at a time.
+- Show a remaining-time estimate after the first PDF or citation batch finishes.
 - Enter extraction fields and research questions in the browser.
 - Use an OpenAI-compatible API endpoint.
 - Export results as an Excel `.xlsx` workbook.
@@ -48,7 +52,6 @@ You can change the base URL later if you use another OpenAI-compatible provider.
 - Each PDF is processed as one article record.
 - If one PDF fails, the batch continues.
 - Missing information should be reported as `not found`, not guessed.
-- Confidence cells marked `medium` or `low` are highlighted in the Excel export for review.
 - MMAT response cells marked `No` or `Can't tell` are highlighted for review.
 - If the extraction fields and research questions stay the same, the summary sheet keeps the same column structure.
 - The Excel export includes extraction sheets, MMAT quality assessment sheets, and a `Methodology Prompt` sheet with the actual prompts used.

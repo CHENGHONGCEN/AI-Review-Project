@@ -26,7 +26,6 @@ def add_rows_to_sheet(
 
 def tune_excel_sheet(
     sheet: Any,
-    confidence_needs_review: Callable[[str], bool],
     mmat_response_needs_review: Callable[[str], bool],
 ) -> None:
     header_fill = PatternFill("solid", fgColor="1F2937")
@@ -57,14 +56,11 @@ def tune_excel_sheet(
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             cell.border = border
-            is_confidence_cell = "confidence" in header_by_column.get(cell.column, "")
             is_response_cell = "response" in header_by_column.get(cell.column, "")
             if (
                 isinstance(cell.value, str)
-                and (
-                    (is_confidence_cell and confidence_needs_review(cell.value))
-                    or (is_response_cell and mmat_response_needs_review(cell.value))
-                )
+                and is_response_cell
+                and mmat_response_needs_review(cell.value)
             ):
                 cell.fill = review_fill
 
@@ -91,7 +87,7 @@ def merge_repeated_evidence_cells(sheet: Any) -> None:
     if sheet.max_row < 3:
         return
 
-    merge_columns = [1, 2, 3, 4, 5]
+    merge_columns = [1, 2, 3, 4]
     group_start = 2
     previous_key = None
 
@@ -135,7 +131,6 @@ def build_excel_export(
     mmat_result_to_summary_row: Callable[[dict[str, Any]], dict[str, str]],
     mmat_result_to_evidence_rows: Callable[[dict[str, Any]], list[dict[str, str]]],
     clean_cell_value: Callable[[Any], Any],
-    confidence_needs_review: Callable[[str], bool],
     mmat_response_needs_review: Callable[[str], bool],
     mmat_manual_version: str,
 ) -> bytes:
@@ -152,15 +147,15 @@ def build_excel_export(
     if summary_rows:
         summary_sheet.delete_rows(1, 1)
         add_rows_to_sheet(summary_sheet, summary_rows, clean_cell_value)
-        tune_excel_sheet(summary_sheet, confidence_needs_review, mmat_response_needs_review)
+        tune_excel_sheet(summary_sheet, mmat_response_needs_review)
 
     evidence_sheet = workbook.create_sheet("Evidence Excerpts")
     if evidence_rows:
         add_rows_to_sheet(evidence_sheet, evidence_rows, clean_cell_value)
     else:
-        evidence_sheet.append(["File names", "title", "research question", "answer_summary", "confidence", "excerpt", "source_location", "relevance_note"])
+        evidence_sheet.append(["File names", "title", "research question", "answer_summary", "excerpt", "source_location", "relevance_note"])
     merge_repeated_evidence_cells(evidence_sheet)
-    tune_excel_sheet(evidence_sheet, confidence_needs_review, mmat_response_needs_review)
+    tune_excel_sheet(evidence_sheet, mmat_response_needs_review)
 
     mmat_summary_sheet = workbook.create_sheet("MMAT Summary")
     mmat_summary_rows = [mmat_result_to_summary_row(result) for result in qa_results]
@@ -175,10 +170,9 @@ def build_excel_export(
                 "study_design_category",
                 "S1 response",
                 "S2 response",
-                "review_warnings",
             ]
         )
-    tune_excel_sheet(mmat_summary_sheet, confidence_needs_review, mmat_response_needs_review)
+    tune_excel_sheet(mmat_summary_sheet, mmat_response_needs_review)
 
     mmat_evidence_sheet = workbook.create_sheet("MMAT Evidence")
     mmat_evidence_rows = []
@@ -198,11 +192,9 @@ def build_excel_export(
                 "response",
                 "justification",
                 "source_location",
-                "confidence",
-                "low_confidence_reason",
             ]
         )
-    tune_excel_sheet(mmat_evidence_sheet, confidence_needs_review, mmat_response_needs_review)
+    tune_excel_sheet(mmat_evidence_sheet, mmat_response_needs_review)
 
     methodology_sheet = workbook.create_sheet("Methodology Prompt")
     methodology_sheet.append(["item", "value"])
@@ -212,7 +204,7 @@ def build_excel_export(
     methodology_sheet.append(["MMAT editable prompt used", qa_results[0].get("mmat_user_prompt_used", "not recorded") if qa_results else "not recorded"])
     methodology_sheet.append(["MMAT full prompt used", qa_results[0].get("mmat_prompt_used", "not recorded") if qa_results else "not recorded"])
     methodology_sheet.append(["Prompt note", "These are the actual prompt texts sent to the AI model for extraction and MMAT quality assessment."])
-    tune_excel_sheet(methodology_sheet, confidence_needs_review, mmat_response_needs_review)
+    tune_excel_sheet(methodology_sheet, mmat_response_needs_review)
     methodology_sheet.column_dimensions["A"].width = 22
     methodology_sheet.column_dimensions["B"].width = 100
     methodology_sheet.row_dimensions[3].height = 240
