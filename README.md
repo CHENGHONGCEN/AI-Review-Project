@@ -2,7 +2,7 @@
 
 This is a local Streamlit app for extracting systematic-review information from batches of research article PDFs.
 
-Current release: `v0.13.0` · Last updated: `2026-07-23`
+Current release: `v0.13.1` · Last updated: `2026-07-23`
 
 The app is designed for personal research use:
 

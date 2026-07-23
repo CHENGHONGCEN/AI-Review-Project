@@ -133,6 +133,7 @@ def build_excel_export(
     clean_cell_value: Callable[[Any], Any],
     mmat_response_needs_review: Callable[[str], bool],
     mmat_manual_version: str,
+    confidence_needs_review: Callable[[str], bool] | None = None,
 ) -> bytes:
     workbook = Workbook()
     summary_sheet = workbook.active

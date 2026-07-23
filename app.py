@@ -25,7 +25,7 @@ import pdf_highlighting
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-5.5"
-APP_VERSION = "0.13.0"
+APP_VERSION = "0.13.1"
 APP_LAST_UPDATED = "2026-07-23"
 SIMILARITY_THRESHOLD = 0.95
 CITATION_ABSTRACT_TOKEN_OVERLAP_THRESHOLD = 0.95
@@ -1514,6 +1514,11 @@ def mmat_response_needs_review(value: str) -> bool:
     return value in {"No", "Can't tell"}
 
 
+def legacy_confidence_needs_review(_value: str) -> bool:
+    """Compatibility shim for a cached pre-v0.13.0 export module."""
+    return False
+
+
 def style_results(df: pd.DataFrame) -> Any:
     def highlight(value: Any) -> str:
         if isinstance(value, str) and mmat_response_needs_review(value):
@@ -2886,6 +2891,7 @@ def render_results() -> None:
             mmat_result_to_summary_row=mmat_result_to_summary_row,
             mmat_result_to_evidence_rows=mmat_result_to_evidence_rows,
             clean_cell_value=remove_excel_control_chars,
+            confidence_needs_review=legacy_confidence_needs_review,
             mmat_response_needs_review=mmat_response_needs_review,
             mmat_manual_version=MMAT_MANUAL_VERSION,
         )
