@@ -21,12 +21,14 @@ from openai import OpenAI
 import exports as export_service
 import extraction as extraction_service
 import pdf_highlighting
+import screening as screening_service
 
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-5.5"
-APP_VERSION = "0.13.1"
-APP_LAST_UPDATED = "2026-07-23"
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+APP_VERSION = "0.14.0"
+APP_LAST_UPDATED = "2026-08-03"
 SIMILARITY_THRESHOLD = 0.95
 CITATION_ABSTRACT_TOKEN_OVERLAP_THRESHOLD = 0.95
 CITATION_AI_MAX_BATCH_RECORDS = 8
@@ -744,6 +746,7 @@ def citation_from_tags(
         "ai_reason": "",
         "ai_evidence": "",
         "needs_human_review": False,
+        "screening_results": {},
     }
 
 
@@ -967,49 +970,65 @@ def mark_citation_inclusions(
     )
 
     data = json.loads(response.output_text)
-    decisions = {
-        clean_text(item.get("record_id"), ""): item
-        for item in data.get("records", [])
-        if isinstance(item, dict)
-    }
-    for record in records:
-        decision = decisions.get(record.get("record_id", ""), {})
-        ai_decision = clean_text(decision.get("ai_decision"), "").casefold()
-        if ai_decision not in {"include", "exclude", "unsure"}:
-            ai_decision = (
-                "include"
-                if clean_bool(decision.get("ai_suggested_inclusion"), True)
-                else "exclude"
-            )
-        suggested_inclusion = ai_decision in {"include", "unsure"}
-        suggested_action = clean_text(decision.get("suggested_action"), "")
-        if not suggested_action:
-            suggested_action = {
-                "include": "keep for full-text review",
-                "unsure": "human review",
-                "exclude": "exclude",
-            }[ai_decision]
-        record["ai_decision"] = ai_decision
-        record["ai_suggested_action"] = suggested_action
-        record["ai_suggested_inclusion"] = suggested_inclusion
-        record["ai_suggested_exclusion"] = ai_decision == "exclude"
-        record["ai_matched_criteria"] = format_matched_criterion_numbers(
-            decision.get("matched_criteria"),
-            len(inclusion_criteria),
-        )
-        record["ai_matched_exclusion_criteria"] = clean_text(
-            format_matched_criterion_numbers(
-                decision.get("matched_exclusion_criteria"),
-                len(exclusion_criteria),
-            ),
-        )
-        record["ai_exclusion_reason"] = clean_text(decision.get("exclusion_reason"), "")
-        record["ai_reason"] = clean_text(decision.get("reason"), "")
-        record["ai_evidence"] = clean_text(decision.get("evidence"), "")
-        record["needs_human_review"] = clean_bool(
-            decision.get("needs_human_review"),
-            ai_decision == "unsure",
-        )
+    screening_service.apply_provider_decisions(
+        records=records,
+        response_data=data,
+        provider="openai",
+        model=model,
+        inclusion_criteria_count=len(inclusion_criteria),
+        exclusion_criteria_count=len(exclusion_criteria),
+    )
+    return records, prompt
+
+
+def mark_citation_inclusions_gemini(
+    records: list[dict[str, Any]],
+    inclusion_criteria: list[str],
+    exclusion_criteria: list[str],
+    api_key: str,
+    model: str,
+    prompt_template: str,
+) -> tuple[list[dict[str, Any]], str]:
+    try:
+        from google import genai
+    except ImportError as exc:
+        raise RuntimeError(
+            "Gemini support is not installed. Run pip install -r requirements.txt."
+        ) from exc
+
+    prompt = make_inclusion_prompt(
+        records,
+        inclusion_criteria,
+        exclusion_criteria,
+        prompt_template,
+    )
+    client = genai.Client(
+        api_key=api_key,
+        http_options={"api_version": "v1"},
+    )
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config={
+            "response_mime_type": "application/json",
+            "response_json_schema": INCLUSION_MARKING_SCHEMA,
+        },
+    )
+    parsed_response = getattr(response, "parsed", None)
+    response_text = getattr(response, "text", "")
+    data = (
+        parsed_response
+        if isinstance(parsed_response, dict)
+        else json.loads(response_text)
+    )
+    screening_service.apply_provider_decisions(
+        records=records,
+        response_data=data,
+        provider="gemini",
+        model=model,
+        inclusion_criteria_count=len(inclusion_criteria),
+        exclusion_criteria_count=len(exclusion_criteria),
+    )
     return records, prompt
 
 
@@ -1086,6 +1105,7 @@ def mark_citation_inclusions_batched(
     status: Any | None = None,
     progress: Any | None = None,
     checkpoint: Any | None = None,
+    provider: str = "openai",
 ) -> tuple[list[dict[str, Any]], str]:
     if not records:
         return records, citation_inclusion_prompt_note(
@@ -1099,23 +1119,36 @@ def mark_citation_inclusions_batched(
     marked_records: list[dict[str, Any]] = []
     total_batches = len(batches)
     started_at = monotonic()
+    provider_label = "OpenAI" if provider == "openai" else "Gemini"
 
     for batch_index, batch in enumerate(batches, start=1):
         if status is not None:
             status.info(
-                f"AI marking citation batch {batch_index}/{total_batches} "
+                f"{provider_label} marking citation batch {batch_index}/{total_batches} "
                 f"({len(batch)} records). "
                 f"{estimated_time_text(started_at, batch_index - 1, total_batches)}"
             )
-        marked_batch, _prompt_used = mark_citation_inclusions(
-            records=batch,
-            inclusion_criteria=inclusion_criteria,
-            exclusion_criteria=exclusion_criteria,
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            prompt_template=prompt_template,
-        )
+        if provider == "openai":
+            marked_batch, _prompt_used = mark_citation_inclusions(
+                records=batch,
+                inclusion_criteria=inclusion_criteria,
+                exclusion_criteria=exclusion_criteria,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                prompt_template=prompt_template,
+            )
+        elif provider == "gemini":
+            marked_batch, _prompt_used = mark_citation_inclusions_gemini(
+                records=batch,
+                inclusion_criteria=inclusion_criteria,
+                exclusion_criteria=exclusion_criteria,
+                api_key=api_key,
+                model=model,
+                prompt_template=prompt_template,
+            )
+        else:
+            raise ValueError(f"Unsupported screening provider: {provider}")
         marked_records.extend(marked_batch)
         if checkpoint is not None:
             remaining_records = [
@@ -1128,7 +1161,7 @@ def mark_citation_inclusions_batched(
             progress.progress(batch_index / total_batches)
         if status is not None and batch_index < total_batches:
             status.info(
-                f"Completed citation batch {batch_index}/{total_batches}. "
+                f"Completed {provider_label} citation batch {batch_index}/{total_batches}. "
                 f"{estimated_time_text(started_at, batch_index, total_batches)}"
             )
         if batch_index < total_batches and CITATION_AI_BATCH_DELAY_SECONDS > 0:
@@ -1599,7 +1632,15 @@ def mmat_result_to_evidence_rows(result: dict[str, Any]) -> list[dict[str, str]]
     return rows
 
 
-def citation_suggests_inclusion(record: dict[str, Any]) -> bool:
+def citation_suggests_inclusion(
+    record: dict[str, Any],
+    provider: str = "openai",
+) -> bool:
+    result = screening_service.provider_result(record, provider)
+    if result is not None:
+        return screening_service.provider_suggests_inclusion(record, provider)
+    if provider != "openai":
+        return False
     ai_decision = clean_text(record.get("ai_decision"), "").casefold()
     if ai_decision in {"include", "unsure"}:
         return True
@@ -1634,34 +1675,131 @@ def citation_to_screening_row(
     record: dict[str, Any],
     inclusion_criteria_count: int = 0,
     exclusion_criteria_count: int = 0,
+    provider: str = "openai",
 ) -> dict[str, str]:
+    provider_result = screening_service.provider_result(record, provider)
+    if provider_result is not None:
+        decision = provider_result.get("decision")
+        reason = provider_result.get("reason")
+        matched_criteria = provider_result.get("matched_criteria")
+        matched_exclusion_criteria = provider_result.get(
+            "matched_exclusion_criteria"
+        )
+        needs_human_review = provider_result.get("needs_human_review")
+    elif provider == "openai":
+        decision = record.get("ai_decision")
+        reason = record.get("ai_reason")
+        matched_criteria = record.get("ai_matched_criteria")
+        matched_exclusion_criteria = record.get(
+            "ai_matched_exclusion_criteria"
+        )
+        needs_human_review = record.get("needs_human_review")
+    else:
+        decision = ""
+        reason = ""
+        matched_criteria = ""
+        matched_exclusion_criteria = ""
+        needs_human_review = True
+
     return {
         "Record ID": clean_text(record.get("record_id"), ""),
         "Title": clean_text(record.get("title"), ""),
         "Abstract": clean_text(record.get("abstract"), ""),
-        "AI suggestion": format_ai_suggestion(record.get("ai_decision")),
-        "Reason": clean_text(record.get("ai_reason"), ""),
+        "AI suggestion": format_ai_suggestion(decision) if decision else "",
+        "Reason": clean_text(reason, ""),
         "matched inclusion criteria": format_matched_criterion_numbers(
-            record.get("ai_matched_criteria"),
+            matched_criteria,
             inclusion_criteria_count,
         ),
         "matched exclusion criteria": format_matched_criterion_numbers(
-            record.get("ai_matched_exclusion_criteria"),
+            matched_exclusion_criteria,
             exclusion_criteria_count,
         ),
-        "needs human review": "YES" if record.get("needs_human_review") else "NO",
+        "needs human review": "YES" if needs_human_review else "NO",
+    }
+
+
+def citation_has_gemini_results(records: list[dict[str, Any]]) -> bool:
+    return any(
+        screening_service.provider_result(record, "gemini") is not None
+        for record in records
+    )
+
+
+def citation_to_comparison_row(
+    record: dict[str, Any],
+    inclusion_criteria_count: int = 0,
+    exclusion_criteria_count: int = 0,
+) -> dict[str, str]:
+    openai_result = screening_service.provider_result(record, "openai") or {}
+    gemini_result = screening_service.provider_result(record, "gemini") or {}
+    comparison = screening_service.comparison_for_record(record)
+    return {
+        "Record ID": clean_text(record.get("record_id"), ""),
+        "Title": clean_text(record.get("title"), ""),
+        "Abstract": clean_text(record.get("abstract"), ""),
+        "OpenAI suggestion": (
+            format_ai_suggestion(openai_result.get("decision"))
+            if openai_result
+            else ""
+        ),
+        "OpenAI reason": clean_text(openai_result.get("reason"), ""),
+        "OpenAI matched inclusion criteria": format_matched_criterion_numbers(
+            openai_result.get("matched_criteria"),
+            inclusion_criteria_count,
+        ),
+        "OpenAI matched exclusion criteria": format_matched_criterion_numbers(
+            openai_result.get("matched_exclusion_criteria"),
+            exclusion_criteria_count,
+        ),
+        "OpenAI model review": (
+            "YES" if openai_result.get("needs_human_review") else "NO"
+        )
+        if openai_result
+        else "",
+        "Gemini suggestion": (
+            format_ai_suggestion(gemini_result.get("decision"))
+            if gemini_result
+            else ""
+        ),
+        "Gemini reason": clean_text(gemini_result.get("reason"), ""),
+        "Gemini matched inclusion criteria": format_matched_criterion_numbers(
+            gemini_result.get("matched_criteria"),
+            inclusion_criteria_count,
+        ),
+        "Gemini matched exclusion criteria": format_matched_criterion_numbers(
+            gemini_result.get("matched_exclusion_criteria"),
+            exclusion_criteria_count,
+        ),
+        "Gemini model review": (
+            "YES" if gemini_result.get("needs_human_review") else "NO"
+        )
+        if gemini_result
+        else "",
+        "Comparison": comparison["status"],
+        "needs human review": (
+            "YES" if comparison["needs_human_review"] else "NO"
+        ),
     }
 
 
 def citation_state_payload() -> dict[str, Any]:
     return {
         "backup_type": "citation_screening_state",
-        "schema_version": 1,
+        "schema_version": 2,
         "citation_records": st.session_state.get("citation_records", []),
         "citation_duplicate_log": st.session_state.get("citation_duplicate_log", []),
         "citation_import_log": st.session_state.get("citation_import_log", []),
         "citation_errors": st.session_state.get("citation_errors", []),
         "citation_ai_prompt_used": st.session_state.get("citation_ai_prompt_used", ""),
+        "citation_ai_prompts_used": st.session_state.get(
+            "citation_ai_prompts_used",
+            {},
+        ),
+        "citation_screening_run": st.session_state.get(
+            "citation_screening_run",
+            {},
+        ),
         "citation_imported_count": int(st.session_state.get("citation_imported_count", 0)),
         "citation_export_timestamp": st.session_state.get("citation_export_timestamp", ""),
         "citation_inclusion_criteria_text": st.session_state.get("citation_inclusion_criteria", ""),
@@ -1671,11 +1809,43 @@ def citation_state_payload() -> dict[str, Any]:
 
 
 def apply_citation_state(payload: dict[str, Any], restore_criteria: bool = False) -> None:
-    st.session_state.citation_records = payload.get("citation_records", [])
+    schema_version = int(payload.get("schema_version", 1) or 1)
+    records = payload.get("citation_records", [])
+    if schema_version < 2:
+        legacy_marked = bool(payload.get("citation_ai_prompt_used"))
+        records = [
+            screening_service.migrate_v1_record(record, marked=legacy_marked)
+            if isinstance(record, dict)
+            else record
+            for record in records
+        ]
+    st.session_state.citation_records = records
     st.session_state.citation_duplicate_log = payload.get("citation_duplicate_log", [])
     st.session_state.citation_import_log = payload.get("citation_import_log", [])
     st.session_state.citation_errors = payload.get("citation_errors", [])
     st.session_state.citation_ai_prompt_used = payload.get("citation_ai_prompt_used", "")
+    prompts_used = payload.get("citation_ai_prompts_used", {})
+    if not isinstance(prompts_used, dict):
+        prompts_used = {}
+    if not prompts_used and payload.get("citation_ai_prompt_used"):
+        prompts_used = {"openai": payload.get("citation_ai_prompt_used", "")}
+    st.session_state.citation_ai_prompts_used = prompts_used
+    run_metadata = payload.get("citation_screening_run", {})
+    if not isinstance(run_metadata, dict):
+        run_metadata = {}
+    if schema_version < 2 and not run_metadata:
+        run_metadata = {
+            "dual_model_enabled": False,
+            "providers": {
+                "openai": {
+                    "model": "",
+                    "status": "complete" if prompts_used else "not_run",
+                    "error": "",
+                }
+            },
+            "schema_migrated_from": 1,
+        }
+    st.session_state.citation_screening_run = run_metadata
     st.session_state.citation_imported_count = int(payload.get("citation_imported_count", 0) or 0)
     st.session_state.citation_export_timestamp = payload.get("citation_export_timestamp", "")
     if restore_criteria:
@@ -1695,6 +1865,9 @@ def parse_citation_backup_upload(uploaded_backup: Any) -> tuple[dict[str, Any] |
 
     if not isinstance(payload, dict):
         return None, "The uploaded JSON backup must contain one object."
+    schema_version = payload.get("schema_version", 1)
+    if schema_version not in {1, 2}:
+        return None, f"Unsupported citation backup schema version: {schema_version}."
     if not isinstance(payload.get("citation_records"), list):
         return None, "The uploaded JSON backup does not contain citation screening records."
 
@@ -1750,6 +1923,8 @@ def clear_citation_state() -> None:
             "citation_import_log": [],
             "citation_errors": [],
             "citation_ai_prompt_used": "",
+            "citation_ai_prompts_used": {},
+            "citation_screening_run": {},
             "citation_imported_count": 0,
             "citation_export_timestamp": "",
         }
@@ -1769,13 +1944,176 @@ def persist_citation_records(
     records: list[dict[str, Any]],
     ai_prompt_used: str | None = None,
     export_timestamp: str | None = None,
+    prompts_used: dict[str, str] | None = None,
+    run_metadata: dict[str, Any] | None = None,
 ) -> None:
     st.session_state.citation_records = records
     if ai_prompt_used is not None:
         st.session_state.citation_ai_prompt_used = ai_prompt_used
     if export_timestamp is not None:
         st.session_state.citation_export_timestamp = export_timestamp
+    if prompts_used is not None:
+        st.session_state.citation_ai_prompts_used = prompts_used
+    if run_metadata is not None:
+        st.session_state.citation_screening_run = run_metadata
     save_citation_state()
+
+
+def run_screening_models(
+    records: list[dict[str, Any]],
+    inclusion_criteria: list[str],
+    exclusion_criteria: list[str],
+    openai_api_key: str,
+    base_url: str,
+    openai_model: str,
+    prompt_template: str,
+    dual_model_enabled: bool,
+    gemini_api_key: str,
+    gemini_model: str,
+    status: Any | None = None,
+    progress: Any | None = None,
+    export_timestamp: str | None = None,
+    retry_incomplete: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, Any], list[str]]:
+    providers = ["openai", "gemini"] if dual_model_enabled else ["openai"]
+    if retry_incomplete:
+        previous_metadata = st.session_state.get("citation_screening_run", {})
+        run_metadata = (
+            json.loads(json.dumps(previous_metadata))
+            if isinstance(previous_metadata, dict)
+            else {}
+        )
+        run_metadata.setdefault("providers", {})
+        run_metadata["retry_started_at"] = datetime.now().isoformat(timespec="seconds")
+        prompts_used = dict(st.session_state.get("citation_ai_prompts_used", {}))
+    else:
+        screening_service.clear_provider_results(records)
+        run_metadata = {
+            "dual_model_enabled": dual_model_enabled,
+            "same_prompt_for_both_models": dual_model_enabled,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "completed_at": "",
+            "inclusion_criteria": inclusion_criteria,
+            "exclusion_criteria": exclusion_criteria,
+            "batch_max_records": CITATION_AI_MAX_BATCH_RECORDS,
+            "batch_character_budget": CITATION_AI_BATCH_CHAR_BUDGET,
+            "providers": {},
+        }
+        prompts_used = {}
+
+    prompt_note = citation_inclusion_prompt_note(
+        prompt_template,
+        inclusion_criteria,
+        exclusion_criteria,
+        len(records),
+    )
+    errors: list[str] = []
+    provider_settings = {
+        "openai": {
+            "api_key": openai_api_key,
+            "base_url": base_url,
+            "model": openai_model,
+        },
+        "gemini": {
+            "api_key": gemini_api_key,
+            "base_url": "",
+            "model": gemini_model,
+        },
+    }
+
+    for provider in providers:
+        provider_label = "OpenAI" if provider == "openai" else "Gemini"
+        provider_records = screening_service.missing_provider_records(records, provider)
+        provider_metadata = run_metadata["providers"].setdefault(provider, {})
+        provider_metadata.update(
+            {
+                "provider": provider,
+                "model": provider_settings[provider]["model"],
+                "requested_records": len(records),
+                "error": "",
+            }
+        )
+        if not provider_records:
+            provider_metadata["status"] = "complete"
+            provider_metadata["completed_records"] = len(records)
+            continue
+
+        prompts_used[provider] = prompt_note
+        provider_metadata["status"] = "running"
+        provider_metadata["attempted_records"] = len(provider_records)
+        provider_metadata["last_attempt_started_at"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+        persist_citation_records(
+            records,
+            ai_prompt_used=prompts_used.get("openai", ""),
+            export_timestamp=export_timestamp,
+            prompts_used=prompts_used,
+            run_metadata=run_metadata,
+        )
+
+        try:
+            mark_citation_inclusions_batched(
+                records=provider_records,
+                inclusion_criteria=inclusion_criteria,
+                exclusion_criteria=exclusion_criteria,
+                api_key=provider_settings[provider]["api_key"],
+                base_url=provider_settings[provider]["base_url"],
+                model=provider_settings[provider]["model"],
+                prompt_template=prompt_template,
+                status=status,
+                progress=progress,
+                checkpoint=lambda _checkpoint_records: persist_citation_records(
+                    records,
+                    ai_prompt_used=prompts_used.get("openai", ""),
+                    export_timestamp=export_timestamp,
+                    prompts_used=prompts_used,
+                    run_metadata=run_metadata,
+                ),
+                provider=provider,
+            )
+            remaining_count = len(
+                screening_service.missing_provider_records(records, provider)
+            )
+            completed_count = len(records) - remaining_count
+            provider_metadata["completed_records"] = completed_count
+            if remaining_count:
+                provider_metadata["status"] = "partial"
+                provider_metadata["error"] = (
+                    f"The model returned {completed_count} of {len(records)} records."
+                )
+                errors.append(f"{provider_label}: {provider_metadata['error']}")
+            else:
+                provider_metadata["status"] = "complete"
+        except Exception as exc:
+            completed_count = len(records) - len(
+                screening_service.missing_provider_records(records, provider)
+            )
+            provider_metadata["completed_records"] = completed_count
+            provider_metadata["status"] = "partial" if completed_count else "failed"
+            provider_metadata["error"] = str(exc)
+            errors.append(f"{provider_label}: {exc}")
+        finally:
+            provider_metadata["last_attempt_finished_at"] = datetime.now().isoformat(
+                timespec="seconds"
+            )
+            persist_citation_records(
+                records,
+                ai_prompt_used=prompts_used.get("openai", ""),
+                export_timestamp=export_timestamp,
+                prompts_used=prompts_used,
+                run_metadata=run_metadata,
+            )
+
+    run_metadata["completed_at"] = datetime.now().isoformat(timespec="seconds")
+    persist_citation_records(
+        records,
+        ai_prompt_used=prompts_used.get("openai", ""),
+        export_timestamp=export_timestamp,
+        prompts_used=prompts_used,
+        run_metadata=run_metadata,
+    )
+    return records, prompts_used, run_metadata, errors
 
 
 def build_screening_excel_export(
@@ -1785,6 +2123,8 @@ def build_screening_excel_export(
     inclusion_criteria: list[str],
     exclusion_criteria: list[str],
     ai_prompt_used: str,
+    provider: str = "openai",
+    model: str = "",
 ) -> bytes:
     workbook = Workbook()
     results_sheet = workbook.active
@@ -1794,6 +2134,7 @@ def build_screening_excel_export(
             record,
             inclusion_criteria_count=len(inclusion_criteria),
             exclusion_criteria_count=len(exclusion_criteria),
+            provider=provider,
         )
         for record in records
     ]
@@ -1844,12 +2185,182 @@ def build_screening_excel_export(
     methodology_sheet.append(["Deduplication rule 2", "If DOI and PMID are missing, title similarity >= 95% and abstract similarity >= 95% removes the later record as duplicate."])
     methodology_sheet.append(["Inclusion criteria", "\n".join(inclusion_criteria) if inclusion_criteria else "not provided"])
     methodology_sheet.append(["Exclusion criteria", "\n".join(exclusion_criteria) if exclusion_criteria else "not provided"])
+    methodology_sheet.append(["AI provider", "OpenAI" if provider == "openai" else "Gemini"])
+    methodology_sheet.append(["AI model", model or "not recorded"])
     methodology_sheet.append(["AI marking prompt used", ai_prompt_used or "not run"])
     methodology_sheet.append(["AI deletion note", "Records not matching the AI inclusion suggestion are not deleted from the screening Excel."])
     tune_excel_sheet(methodology_sheet)
     methodology_sheet.column_dimensions["A"].width = 26
     methodology_sheet.column_dimensions["B"].width = 100
     methodology_sheet.row_dimensions[6].height = 240
+
+    output = io.BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+def build_dual_model_comparison_export(
+    records: list[dict[str, Any]],
+    duplicate_log: list[dict[str, Any]],
+    import_log: list[dict[str, Any]],
+    inclusion_criteria: list[str],
+    exclusion_criteria: list[str],
+    prompts_used: dict[str, str],
+    run_metadata: dict[str, Any],
+) -> bytes:
+    workbook = Workbook()
+    summary_sheet = workbook.active
+    summary_sheet.title = "Comparison Summary"
+    summary = screening_service.comparison_summary(records)
+    agreement_rate = summary["agreement_rate"]
+    summary_sheet.append(["item", "value"])
+    summary_sheet.append(["Total records", summary["total"]])
+    summary_sheet.append(["Agreement", summary["agreement"]])
+    summary_sheet.append(["Disagreement", summary["disagreement"]])
+    summary_sheet.append(["Incomplete", summary["incomplete"]])
+    summary_sheet.append(["Needs human review", summary["human_review"]])
+    summary_sheet.append(
+        [
+            "Agreement rate among completed pairs",
+            f"{agreement_rate:.2%}" if agreement_rate is not None else "not available",
+        ]
+    )
+    for provider in ("openai", "gemini"):
+        for decision in ("include", "exclude", "unsure"):
+            summary_sheet.append(
+                [
+                    f"{provider.title()} {decision}",
+                    summary[f"{provider}_decisions"].get(decision, 0),
+                ]
+            )
+    for combination, count in sorted(summary["disagreement_combinations"].items()):
+        summary_sheet.append([f"Disagreement: {combination}", count])
+    tune_excel_sheet(summary_sheet)
+
+    comparison_sheet = workbook.create_sheet("Model Comparison")
+    comparison_rows = [
+        citation_to_comparison_row(
+            record,
+            inclusion_criteria_count=len(inclusion_criteria),
+            exclusion_criteria_count=len(exclusion_criteria),
+        )
+        for record in records
+    ]
+    if comparison_rows:
+        add_rows_to_sheet(comparison_sheet, comparison_rows)
+    else:
+        comparison_sheet.append(
+            [
+                "Record ID",
+                "Title",
+                "Abstract",
+                "OpenAI suggestion",
+                "OpenAI reason",
+                "OpenAI matched inclusion criteria",
+                "OpenAI matched exclusion criteria",
+                "OpenAI model review",
+                "Gemini suggestion",
+                "Gemini reason",
+                "Gemini matched inclusion criteria",
+                "Gemini matched exclusion criteria",
+                "Gemini model review",
+                "Comparison",
+                "needs human review",
+            ]
+        )
+    tune_excel_sheet(comparison_sheet)
+    headers = {
+        cell.value: cell.column
+        for cell in comparison_sheet[1]
+    }
+    disagreement_fill = PatternFill("solid", fgColor="FECACA")
+    review_fill = PatternFill("solid", fgColor="FEF3C7")
+    for row_number in range(2, comparison_sheet.max_row + 1):
+        comparison_value = comparison_sheet.cell(
+            row=row_number,
+            column=headers["Comparison"],
+        ).value
+        suggestions = {
+            comparison_sheet.cell(
+                row=row_number,
+                column=headers["OpenAI suggestion"],
+            ).value,
+            comparison_sheet.cell(
+                row=row_number,
+                column=headers["Gemini suggestion"],
+            ).value,
+        }
+        fill = None
+        if comparison_value == "Disagreement":
+            fill = disagreement_fill
+        elif comparison_value == "Incomplete" or "Unsure" in suggestions:
+            fill = review_fill
+        if fill is not None:
+            for cell in comparison_sheet[row_number]:
+                cell.fill = fill
+
+    duplicate_sheet = workbook.create_sheet("Duplicate Log")
+    if duplicate_log:
+        add_rows_to_sheet(duplicate_sheet, duplicate_log)
+    else:
+        duplicate_sheet.append(
+            [
+                "removed_record_id",
+                "removed_title",
+                "kept_record_id",
+                "kept_title",
+                "duplicate_reason",
+            ]
+        )
+    tune_excel_sheet(duplicate_sheet)
+
+    import_sheet = workbook.create_sheet("Import Log")
+    if import_log:
+        add_rows_to_sheet(import_sheet, import_log)
+    else:
+        import_sheet.append(["source_file", "source_format", "parsed_records"])
+    tune_excel_sheet(import_sheet)
+
+    methodology_sheet = workbook.create_sheet("Methodology")
+    methodology_sheet.append(["item", "value"])
+    methodology_sheet.append(["Generated", datetime.now().strftime("%Y-%m-%d %H:%M")])
+    methodology_sheet.append(["Dual-model calibration", "Enabled"])
+    providers = run_metadata.get("providers", {})
+    for provider in ("openai", "gemini"):
+        provider_metadata = providers.get(provider, {})
+        methodology_sheet.append(
+            [f"{provider.title()} model", provider_metadata.get("model", "not recorded")]
+        )
+        methodology_sheet.append(
+            [f"{provider.title()} status", provider_metadata.get("status", "not recorded")]
+        )
+        methodology_sheet.append(
+            [f"{provider.title()} error", provider_metadata.get("error", "") or "none"]
+        )
+    methodology_sheet.append(
+        ["Inclusion criteria", "\n".join(inclusion_criteria) if inclusion_criteria else "not provided"]
+    )
+    methodology_sheet.append(
+        ["Exclusion criteria", "\n".join(exclusion_criteria) if exclusion_criteria else "not provided"]
+    )
+    methodology_sheet.append(
+        ["OpenAI prompt used", prompts_used.get("openai", "not run")]
+    )
+    methodology_sheet.append(
+        ["Gemini prompt used", prompts_used.get("gemini", "not run")]
+    )
+    methodology_sheet.append(
+        ["Maximum batch size", CITATION_AI_MAX_BATCH_RECORDS]
+    )
+    methodology_sheet.append(
+        ["Approximate batch character budget", CITATION_AI_BATCH_CHAR_BUDGET]
+    )
+    methodology_sheet.append(
+        ["Comparison rule", "Exact decision match only; disagreements are not automatically adjudicated."]
+    )
+    tune_excel_sheet(methodology_sheet)
+    methodology_sheet.column_dimensions["A"].width = 34
+    methodology_sheet.column_dimensions["B"].width = 100
 
     output = io.BytesIO()
     workbook.save(output)
@@ -2102,6 +2613,8 @@ def initialise_state() -> None:
     st.session_state.setdefault("citation_import_log", [])
     st.session_state.setdefault("citation_errors", [])
     st.session_state.setdefault("citation_ai_prompt_used", "")
+    st.session_state.setdefault("citation_ai_prompts_used", {})
+    st.session_state.setdefault("citation_screening_run", {})
     st.session_state.setdefault("citation_imported_count", 0)
     st.session_state.setdefault("citation_export_timestamp", "")
     st.session_state.setdefault("citation_inclusion_prompt_template", DEFAULT_INCLUSION_PROMPT_TEMPLATE)
@@ -2622,12 +3135,40 @@ def render_upload_intro() -> None:
     )
 
 
-def render_settings() -> tuple[str, str, str]:
+def render_settings() -> tuple[str, str, str, bool, str, str]:
     st.subheader("API settings")
     api_key = st.text_input("API key", type="password", help="The app uses this only for the current browser session.")
     base_url = st.text_input("Base URL", value=DEFAULT_BASE_URL)
     model = st.text_input("Model", value=DEFAULT_MODEL)
-    return api_key, base_url, model
+    dual_model_enabled = st.checkbox(
+        "Enable dual-model calibration for Literature Screening",
+        key="dual_model_calibration_enabled",
+        help="Runs OpenAI and Gemini independently, then shows agreement and disagreement. Extraction and MMAT still use OpenAI only.",
+    )
+    gemini_api_key = ""
+    gemini_model = DEFAULT_GEMINI_MODEL
+    if dual_model_enabled:
+        gemini_api_key = st.text_input(
+            "Gemini API key",
+            type="password",
+            help="Used only in this browser session and never included in backups or exports.",
+        )
+        gemini_model = st.text_input(
+            "Gemini model",
+            value=DEFAULT_GEMINI_MODEL,
+            help="The default stable model is Gemini 3.6 Flash. You can enter gemini-3.5-flash-lite for a lower-cost alternative.",
+        )
+        st.caption(
+            "Privacy note: content submitted under Gemini's free tier may be used by Google to improve its products. Use public, non-sensitive citation data for free-tier testing."
+        )
+    return (
+        api_key,
+        base_url,
+        model,
+        dual_model_enabled,
+        gemini_api_key,
+        gemini_model,
+    )
 
 
 def restore_default_prompt() -> None:
@@ -3075,6 +3616,9 @@ def render_citation_screening(
     base_url: str,
     model: str,
     inclusion_prompt_template: str,
+    dual_model_enabled: bool,
+    gemini_api_key: str,
+    gemini_model: str,
 ) -> None:
     st.subheader("Literature screening")
     st.markdown(
@@ -3178,6 +3722,8 @@ def render_citation_screening(
                 st.session_state.citation_import_log = import_log
                 st.session_state.citation_errors = errors
                 st.session_state.citation_ai_prompt_used = ""
+                st.session_state.citation_ai_prompts_used = {}
+                st.session_state.citation_screening_run = {}
                 st.session_state.citation_imported_count = 0
                 st.session_state.citation_export_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
                 save_citation_state()
@@ -3192,6 +3738,8 @@ def render_citation_screening(
                 st.session_state.citation_import_log = import_log
                 st.session_state.citation_errors = errors
                 st.session_state.citation_ai_prompt_used = ""
+                st.session_state.citation_ai_prompts_used = {}
+                st.session_state.citation_screening_run = {}
                 st.session_state.citation_imported_count = len(records)
                 st.session_state.citation_export_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
                 save_citation_state()
@@ -3207,6 +3755,8 @@ def render_citation_screening(
             st.warning("Please enter at least one Inclusion Criterion.")
         elif not api_key:
             st.warning("Please enter an API key before running AI inclusion marking.")
+        elif dual_model_enabled and not gemini_api_key:
+            st.warning("Please enter a Gemini API key for dual-model calibration.")
         else:
             if citation_files:
                 records, errors, import_log = parse_citation_uploads(citation_files)
@@ -3225,6 +3775,8 @@ def render_citation_screening(
                 st.session_state.citation_errors = errors
                 st.session_state.citation_imported_count = len(records)
                 st.session_state.citation_ai_prompt_used = ""
+                st.session_state.citation_ai_prompts_used = {}
+                st.session_state.citation_screening_run = {}
             elif not st.session_state.citation_records:
                 if not citation_files:
                     st.warning("Please upload at least one RIS or NBIB file, or run deduplication first.")
@@ -3240,36 +3792,30 @@ def render_citation_screening(
                 len(st.session_state.citation_records),
             )
             save_citation_state()
-            try:
-                marking_started_at = monotonic()
-                marked_records, prompt_used = mark_citation_inclusions_batched(
-                    records=st.session_state.citation_records,
-                    inclusion_criteria=inclusion_criteria,
-                    exclusion_criteria=exclusion_criteria,
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    prompt_template=inclusion_prompt_template,
-                    status=status,
-                    progress=progress,
-                    checkpoint=lambda checkpoint_records: persist_citation_records(
-                        checkpoint_records,
-                        export_timestamp=run_timestamp,
-                    ),
+            marking_started_at = monotonic()
+            _, _, _, model_errors = run_screening_models(
+                records=st.session_state.citation_records,
+                inclusion_criteria=inclusion_criteria,
+                exclusion_criteria=exclusion_criteria,
+                openai_api_key=api_key,
+                base_url=base_url,
+                openai_model=model,
+                prompt_template=inclusion_prompt_template,
+                dual_model_enabled=dual_model_enabled,
+                gemini_api_key=gemini_api_key,
+                gemini_model=gemini_model,
+                status=status,
+                progress=progress,
+                export_timestamp=run_timestamp,
+            )
+            elapsed = format_duration(monotonic() - marking_started_at)
+            if model_errors:
+                status.warning(
+                    f"Screening finished with incomplete model results in {elapsed}. "
+                    + " | ".join(model_errors)
                 )
-                persist_citation_records(
-                    marked_records,
-                    ai_prompt_used=prompt_used,
-                    export_timestamp=run_timestamp,
-                )
-                status.success(
-                    "AI inclusion marking finished in "
-                    f"{format_duration(monotonic() - marking_started_at)}."
-                )
-                st.rerun()
-            except Exception as exc:
-                save_citation_state()
-                status.error(f"AI inclusion marking failed: {exc}")
+            else:
+                status.success(f"AI inclusion marking finished in {elapsed}.")
 
     if run_full_screening:
         if not citation_files:
@@ -3278,6 +3824,8 @@ def render_citation_screening(
             st.warning("Please enter at least one Inclusion Criterion.")
         elif not api_key:
             st.warning("Please enter an API key before running AI inclusion marking.")
+        elif dual_model_enabled and not gemini_api_key:
+            st.warning("Please enter a Gemini API key for dual-model calibration.")
         else:
             status = st.empty()
             status.info("Deduplicating citations...")
@@ -3299,41 +3847,129 @@ def render_citation_screening(
                 ),
                 export_timestamp=run_timestamp,
             )
-            try:
-                progress = st.progress(0)
-                marked_records, prompt_used = mark_citation_inclusions_batched(
-                    records=deduplicated_records,
-                    inclusion_criteria=inclusion_criteria,
-                    exclusion_criteria=exclusion_criteria,
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    prompt_template=inclusion_prompt_template,
-                    status=status,
-                    progress=progress,
-                    checkpoint=lambda checkpoint_records: persist_citation_records(
-                        checkpoint_records,
-                        export_timestamp=run_timestamp,
-                    ),
+            progress = st.progress(0)
+            _, _, _, model_errors = run_screening_models(
+                records=deduplicated_records,
+                inclusion_criteria=inclusion_criteria,
+                exclusion_criteria=exclusion_criteria,
+                openai_api_key=api_key,
+                base_url=base_url,
+                openai_model=model,
+                prompt_template=inclusion_prompt_template,
+                dual_model_enabled=dual_model_enabled,
+                gemini_api_key=gemini_api_key,
+                gemini_model=gemini_model,
+                status=status,
+                progress=progress,
+                export_timestamp=run_timestamp,
+            )
+            elapsed = format_duration(monotonic() - full_screening_started_at)
+            if model_errors:
+                status.warning(
+                    f"Deduplication finished, but model calibration is incomplete after {elapsed}. "
+                    + " | ".join(model_errors)
                 )
-                persist_citation_records(
-                    marked_records,
-                    ai_prompt_used=prompt_used,
-                    export_timestamp=run_timestamp,
-                )
+            else:
                 status.success(
-                    "Deduplication and AI inclusion marking finished in "
-                    f"{format_duration(monotonic() - full_screening_started_at)}."
+                    f"Deduplication and AI inclusion marking finished in {elapsed}."
                 )
-                st.rerun()
-            except Exception as exc:
-                save_citation_state()
-                status.error(f"Deduplication finished, but AI inclusion marking failed: {exc}")
+
+    current_run_metadata = st.session_state.get("citation_screening_run", {})
+    dual_results_active = bool(
+        isinstance(current_run_metadata, dict)
+        and current_run_metadata.get("dual_model_enabled")
+    ) or citation_has_gemini_results(st.session_state.citation_records)
+    if st.session_state.citation_records and dual_results_active:
+        missing_openai = screening_service.missing_provider_records(
+            st.session_state.citation_records,
+            "openai",
+        )
+        missing_gemini = screening_service.missing_provider_records(
+            st.session_state.citation_records,
+            "gemini",
+        )
+        if missing_openai or missing_gemini:
+            st.warning(
+                "Dual-model calibration is incomplete: "
+                f"{len(missing_openai)} OpenAI and {len(missing_gemini)} Gemini "
+                "record(s) still need results."
+            )
+            if not dual_model_enabled:
+                st.caption(
+                    "Turn on dual-model calibration in API settings to enter the required key(s) and retry only the missing results."
+                )
+            if st.button(
+                "Retry incomplete calibration",
+                disabled=not dual_model_enabled,
+                help="Only records missing an OpenAI or Gemini result are sent again.",
+            ):
+                if missing_openai and not api_key:
+                    st.warning("Please enter the OpenAI API key needed for the missing results.")
+                elif missing_gemini and not gemini_api_key:
+                    st.warning("Please enter the Gemini API key needed for the missing results.")
+                else:
+                    retry_status = st.empty()
+                    retry_progress = st.progress(0)
+                    retry_timestamp = (
+                        st.session_state.citation_export_timestamp
+                        or datetime.now().strftime("%Y%m%d_%H%M")
+                    )
+                    _, _, _, retry_errors = run_screening_models(
+                        records=st.session_state.citation_records,
+                        inclusion_criteria=inclusion_criteria,
+                        exclusion_criteria=exclusion_criteria,
+                        openai_api_key=api_key,
+                        base_url=base_url,
+                        openai_model=model,
+                        prompt_template=inclusion_prompt_template,
+                        dual_model_enabled=True,
+                        gemini_api_key=gemini_api_key,
+                        gemini_model=gemini_model,
+                        status=retry_status,
+                        progress=retry_progress,
+                        export_timestamp=retry_timestamp,
+                        retry_incomplete=True,
+                    )
+                    if retry_errors:
+                        retry_status.warning(
+                            "Retry completed, but some results are still missing. "
+                            + " | ".join(retry_errors)
+                        )
+                    else:
+                        retry_status.success(
+                            "All previously missing calibration results are now complete."
+                        )
 
     if st.session_state.citation_records:
         st.markdown("**Screening results**")
-        screening_df = pd.DataFrame(
-            [
+        if dual_results_active:
+            comparison_summary = screening_service.comparison_summary(
+                st.session_state.citation_records
+            )
+            metric_columns = st.columns(4)
+            metric_columns[0].metric("Agreement", comparison_summary["agreement"])
+            metric_columns[1].metric(
+                "Disagreement",
+                comparison_summary["disagreement"],
+            )
+            metric_columns[2].metric(
+                "Incomplete",
+                comparison_summary["incomplete"],
+            )
+            metric_columns[3].metric(
+                "Needs human review",
+                comparison_summary["human_review"],
+            )
+            screening_rows = [
+                citation_to_comparison_row(
+                    record,
+                    inclusion_criteria_count=len(inclusion_criteria),
+                    exclusion_criteria_count=len(exclusion_criteria),
+                )
+                for record in st.session_state.citation_records
+            ]
+        else:
+            screening_rows = [
                 citation_to_screening_row(
                     record,
                     inclusion_criteria_count=len(inclusion_criteria),
@@ -3341,61 +3977,183 @@ def render_citation_screening(
                 )
                 for record in st.session_state.citation_records
             ]
-        )
+        screening_df = pd.DataFrame(screening_rows)
         st.dataframe(screening_df, width="stretch")
 
         timestamp = st.session_state.citation_export_timestamp or datetime.now().strftime("%Y%m%d_%H%M")
-        excel_bytes = None
-        try:
-            excel_bytes = build_screening_excel_export(
-                records=st.session_state.citation_records,
-                duplicate_log=st.session_state.citation_duplicate_log,
-                import_log=st.session_state.citation_import_log,
-                inclusion_criteria=inclusion_criteria,
-                exclusion_criteria=exclusion_criteria,
-                ai_prompt_used=st.session_state.citation_ai_prompt_used,
-            )
-        except Exception as exc:
-            st.error(f"Excel audit file could not be generated: {exc}")
-        relevant_records = [
-            record
-            for record in st.session_state.citation_records
-            if citation_suggests_inclusion(record)
-        ]
         all_screening_ris = build_ris_export(st.session_state.citation_records)
-        relevant_ris = build_ris_export(relevant_records)
         backup_json = json.dumps(citation_state_payload(), ensure_ascii=False, indent=2).encode("utf-8")
-
-        export_col_1, export_col_2, export_col_3, export_col_4 = st.columns(4)
-        with export_col_1:
-            if excel_bytes is not None:
-                st.download_button(
-                    "Download Excel audit file",
-                    data=excel_bytes,
-                    file_name=f"citation_screening_audit_{timestamp}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        if dual_results_active:
+            run_metadata = st.session_state.get("citation_screening_run", {})
+            prompts_used = st.session_state.get("citation_ai_prompts_used", {})
+            provider_metadata = (
+                run_metadata.get("providers", {})
+                if isinstance(run_metadata, dict)
+                else {}
+            )
+            openai_model_used = provider_metadata.get("openai", {}).get(
+                "model",
+                model,
+            )
+            gemini_model_used = provider_metadata.get("gemini", {}).get(
+                "model",
+                gemini_model,
+            )
+            openai_excel = None
+            gemini_excel = None
+            comparison_excel = None
+            try:
+                openai_excel = build_screening_excel_export(
+                    records=st.session_state.citation_records,
+                    duplicate_log=st.session_state.citation_duplicate_log,
+                    import_log=st.session_state.citation_import_log,
+                    inclusion_criteria=inclusion_criteria,
+                    exclusion_criteria=exclusion_criteria,
+                    ai_prompt_used=prompts_used.get("openai", ""),
+                    provider="openai",
+                    model=openai_model_used,
                 )
-        with export_col_2:
-            st.download_button(
-                "Download RIS: AI suggested inclusion only",
-                data=relevant_ris,
-                file_name=f"ai_suggested_inclusion_records_{timestamp}.ris",
-                mime="application/x-research-info-systems",
+                gemini_excel = build_screening_excel_export(
+                    records=st.session_state.citation_records,
+                    duplicate_log=st.session_state.citation_duplicate_log,
+                    import_log=st.session_state.citation_import_log,
+                    inclusion_criteria=inclusion_criteria,
+                    exclusion_criteria=exclusion_criteria,
+                    ai_prompt_used=prompts_used.get("gemini", ""),
+                    provider="gemini",
+                    model=gemini_model_used,
+                )
+                comparison_excel = build_dual_model_comparison_export(
+                    records=st.session_state.citation_records,
+                    duplicate_log=st.session_state.citation_duplicate_log,
+                    import_log=st.session_state.citation_import_log,
+                    inclusion_criteria=inclusion_criteria,
+                    exclusion_criteria=exclusion_criteria,
+                    prompts_used=prompts_used,
+                    run_metadata=run_metadata,
+                )
+            except Exception as exc:
+                st.error(f"Dual-model Excel files could not be generated: {exc}")
+
+            openai_relevant_ris = build_ris_export(
+                [
+                    record
+                    for record in st.session_state.citation_records
+                    if citation_suggests_inclusion(record, "openai")
+                ]
             )
-        with export_col_3:
-            st.download_button(
-                "Download RIS: all screening records",
-                data=all_screening_ris,
-                file_name=f"all_screening_records_{timestamp}.ris",
-                mime="application/x-research-info-systems",
+            gemini_relevant_ris = build_ris_export(
+                [
+                    record
+                    for record in st.session_state.citation_records
+                    if citation_suggests_inclusion(record, "gemini")
+                ]
             )
-        with export_col_4:
+            export_row_1 = st.columns(3)
+            with export_row_1[0]:
+                if openai_excel is not None:
+                    st.download_button(
+                        "Download OpenAI audit Excel",
+                        data=openai_excel,
+                        file_name=f"openai_citation_screening_audit_{timestamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+            with export_row_1[1]:
+                if gemini_excel is not None:
+                    st.download_button(
+                        "Download Gemini audit Excel",
+                        data=gemini_excel,
+                        file_name=f"gemini_citation_screening_audit_{timestamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+            with export_row_1[2]:
+                if comparison_excel is not None:
+                    st.download_button(
+                        "Download comparison Excel",
+                        data=comparison_excel,
+                        file_name=f"dual_model_screening_comparison_{timestamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+            export_row_2 = st.columns(3)
+            with export_row_2[0]:
+                st.download_button(
+                    "Download OpenAI inclusion RIS",
+                    data=openai_relevant_ris,
+                    file_name=f"openai_suggested_inclusion_records_{timestamp}.ris",
+                    mime="application/x-research-info-systems",
+                )
+            with export_row_2[1]:
+                st.download_button(
+                    "Download Gemini inclusion RIS",
+                    data=gemini_relevant_ris,
+                    file_name=f"gemini_suggested_inclusion_records_{timestamp}.ris",
+                    mime="application/x-research-info-systems",
+                )
+            with export_row_2[2]:
+                st.download_button(
+                    "Download RIS: all screening records",
+                    data=all_screening_ris,
+                    file_name=f"all_screening_records_{timestamp}.ris",
+                    mime="application/x-research-info-systems",
+                )
             st.download_button(
                 "Download JSON backup",
                 data=backup_json,
                 file_name=f"citation_screening_backup_{timestamp}.json",
                 mime="application/json",
             )
+        else:
+            excel_bytes = None
+            try:
+                excel_bytes = build_screening_excel_export(
+                    records=st.session_state.citation_records,
+                    duplicate_log=st.session_state.citation_duplicate_log,
+                    import_log=st.session_state.citation_import_log,
+                    inclusion_criteria=inclusion_criteria,
+                    exclusion_criteria=exclusion_criteria,
+                    ai_prompt_used=st.session_state.citation_ai_prompt_used,
+                    provider="openai",
+                    model=model,
+                )
+            except Exception as exc:
+                st.error(f"Excel audit file could not be generated: {exc}")
+            relevant_ris = build_ris_export(
+                [
+                    record
+                    for record in st.session_state.citation_records
+                    if citation_suggests_inclusion(record)
+                ]
+            )
+            export_col_1, export_col_2, export_col_3, export_col_4 = st.columns(4)
+            with export_col_1:
+                if excel_bytes is not None:
+                    st.download_button(
+                        "Download Excel audit file",
+                        data=excel_bytes,
+                        file_name=f"citation_screening_audit_{timestamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+            with export_col_2:
+                st.download_button(
+                    "Download RIS: AI suggested inclusion only",
+                    data=relevant_ris,
+                    file_name=f"ai_suggested_inclusion_records_{timestamp}.ris",
+                    mime="application/x-research-info-systems",
+                )
+            with export_col_3:
+                st.download_button(
+                    "Download RIS: all screening records",
+                    data=all_screening_ris,
+                    file_name=f"all_screening_records_{timestamp}.ris",
+                    mime="application/x-research-info-systems",
+                )
+            with export_col_4:
+                st.download_button(
+                    "Download JSON backup",
+                    data=backup_json,
+                    file_name=f"citation_screening_backup_{timestamp}.json",
+                    mime="application/json",
+                )
 
     if st.session_state.citation_duplicate_log:
         with st.expander("Duplicate log", expanded=False):
@@ -3426,7 +4184,14 @@ def main() -> None:
             """,
             unsafe_allow_html=True,
         )
-        api_key, base_url, model = render_settings()
+        (
+            api_key,
+            base_url,
+            model,
+            dual_model_enabled,
+            gemini_api_key,
+            gemini_model,
+        ) = render_settings()
         st.divider()
         citation_inclusion_prompt_template, prompt_template, mmat_prompt_template = render_prompt_settings()
         st.divider()
@@ -3434,7 +4199,15 @@ def main() -> None:
 
     render_header()
 
-    render_citation_screening(api_key, base_url, model, citation_inclusion_prompt_template)
+    render_citation_screening(
+        api_key,
+        base_url,
+        model,
+        citation_inclusion_prompt_template,
+        dual_model_enabled,
+        gemini_api_key,
+        gemini_model,
+    )
     st.divider()
 
     render_upload_intro()
